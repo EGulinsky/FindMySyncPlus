@@ -25,6 +25,25 @@ enum ViewSnapshotExport {
         return URL(fileURLWithPath: path)
     }
 
+    /// Screens to render besides the Device Manager, comma-separated. Empty means none.
+    ///
+    /// Set by the driver for **one** case only: these screens show settings and status, not
+    /// device data, so they do not vary with the fixture and rendering them ten times would
+    /// be ten copies of the same picture.
+    ///
+    /// **Their AppKit-drawn controls render as placeholders** — every `Toggle` with
+    /// `.toggleStyle(.switch)`, every `Stepper`, and `ToolTipOverlay`. That is expected and it
+    /// does not make the baseline worthless: the placeholder is deterministic, so it never
+    /// causes a false failure, and everything around it is real. A card vanishing, a label
+    /// changing, wrong data or a broken layout all still show. Partial coverage of a screen
+    /// beats none, and the fix when it is wanted is a custom `ToggleStyle` in the shape of
+    /// `CompactSwitchStyle`, which already renders correctly.
+    static var extraScreens: [String] {
+        (UserDefaults.standard.string(forKey: "demoRenderScreens") ?? "")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     /// Names this run in the manifest — the fixture shape, set by the driver.
     private static var label: String {
         UserDefaults.standard.string(forKey: "demoRenderLabel") ?? "unlabelled"
@@ -111,6 +130,50 @@ enum ViewSnapshotExport {
 
     @MainActor private static var notedPartition = false
 
+    /// The other screens named by `demoRenderScreens`, once each in both appearances.
+    @MainActor
+    private static func renderExtraScreens(to dir: URL, app: AppModel,
+                                           settings: SettingsStore, logger: LogStore) {
+        let wanted = extraScreens
+        guard !wanted.isEmpty else { return }
+
+        for name in wanted {
+            let screen: AnyView
+            switch name {
+            case "HomeView":            screen = AnyView(HomeView())
+            case "GeneralSettingsView": screen = AnyView(GeneralSettingsView())
+            case "AccessSettingsView":  screen = AnyView(AccessSettingsView())
+            case "AboutView":           screen = AnyView(AboutView())
+            default:
+                // Named but unknown: say so rather than skip in silence.
+                logger.log(.warn, "Snapshot export: no screen called '\(name)'")
+                continue
+            }
+            for (appearance, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
+                let renderer = ImageRenderer(content: screen
+                    .environmentObject(settings)
+                    .environmentObject(app)
+                    .environmentObject(logger)
+                    .frame(width: renderWidth)
+                    .tint(.blue)
+                    .background(scheme == .dark ? darkCanvas : lightCanvas)
+                    .environment(\.colorScheme, scheme))
+                renderer.scale = scale
+                let file = "\(name)--\(appearance).png"
+                guard let image = renderer.nsImage,
+                      let tiff = image.tiffRepresentation,
+                      let rep = NSBitmapImageRep(data: tiff),
+                      let png = rep.representation(using: .png, properties: [:]) else {
+                    logger.log(.error, "Snapshot export: \(file) produced no image")
+                    continue
+                }
+                try? png.write(to: dir.appendingPathComponent(file))
+                logger.log(.info, "Snapshot export: wrote \(file) "
+                    + "(\(rep.pixelsWide)x\(rep.pixelsHigh))")
+            }
+        }
+    }
+
     /// The exporter's own lines, which do not belong in the artifact.
     ///
     /// The log is meant to be what the *run* produced — byte-identical to what a user would
@@ -193,6 +256,8 @@ enum ViewSnapshotExport {
                 }
             }
         }
+
+        renderExtraScreens(to: dir, app: app, settings: settings, logger: logger)
 
         // One more hop before reading the log back.
         //
