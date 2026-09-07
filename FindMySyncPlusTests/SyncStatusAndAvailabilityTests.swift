@@ -313,9 +313,9 @@ struct SyncStatusAndAvailabilityTests {
     private static let baseLat = 37.3349
     private static let baseLon = -122.0089
 
-    /// Metres north of the base point, using the same constant the app does.
-    private static func north(_ metres: Double) -> MQTTClient.PublishedState {
-        state(baseLat + metres / 111_320.0, baseLon)
+    /// Meters north of the base point, using the same constant the app does.
+    private static func north(_ meters: Double) -> MQTTClient.PublishedState {
+        state(baseLat + meters / 111_320.0, baseLon)
     }
 
     @Test("nothing is skipped while the setting is off")
@@ -323,7 +323,7 @@ struct SyncStatusAndAvailabilityTests {
         #expect(MQTTClient.suppressionDecision(enabled: false,
                                                previous: Self.north(0),
                                                current: Self.north(0),
-                                               thresholdMetres: 5) == .publish)
+                                               thresholdMeters: 5) == .publish)
     }
 
     /// The primary use, and why 0 is the strictest setting rather than an escape hatch:
@@ -333,7 +333,7 @@ struct SyncStatusAndAvailabilityTests {
         #expect(MQTTClient.suppressionDecision(enabled: true,
                                                previous: Self.north(0),
                                                current: Self.north(0),
-                                               thresholdMetres: 0) == .identical)
+                                               thresholdMeters: 0) == .identical)
     }
 
     /// The off-by-one that would make the feature look enabled and do nothing: two
@@ -343,7 +343,7 @@ struct SyncStatusAndAvailabilityTests {
         #expect(MQTTClient.suppressionDecision(enabled: true,
                                                previous: Self.north(0),
                                                current: Self.north(0.01),
-                                               thresholdMetres: 0) == .publish)
+                                               thresholdMeters: 0) == .publish)
     }
 
     /// The row reads "Skip repeated locations", and a repeated location is the same place
@@ -357,33 +357,33 @@ struct SyncStatusAndAvailabilityTests {
 
         #expect(MQTTClient.suppressionDecision(enabled: true, previous: before,
                                                current: after,
-                                               thresholdMetres: 0) == .identical)
+                                               thresholdMeters: 0) == .identical)
     }
 
     /// Measured on a live account, three stationary runs: an iPhone's recomputed fix moved
     /// 0.01 mm while reporting 3 m accuracy.
-    @Test("recompute noise publishes at zero and suppresses at a tenth of a metre")
+    @Test("recompute noise publishes at zero and suppresses at a tenth of a meter")
     func recomputeNoiseSuppresses() {
         let noise = 0.00001
         #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
                                                current: Self.north(noise),
-                                               thresholdMetres: 0) == .publish)
+                                               thresholdMeters: 0) == .publish)
         #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
                                                current: Self.north(noise),
-                                               thresholdMetres: 0.1) != .publish)
+                                               thresholdMeters: 0.1) != .publish)
     }
 
     /// The same measurement, one device over: a stationary Mac wandered 11 cm. This is why
     /// the first threshold proposed — 1 cm — was wrong by two orders of magnitude.
-    @Test("an 11 cm wobble publishes at a tenth of a metre and suppresses at half")
-    func stationaryWobbleNeedsHalfAMetre() {
+    @Test("an 11 cm wobble publishes at a tenth of a meter and suppresses at half")
+    func stationaryWobbleNeedsHalfAMeter() {
         #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
                                                current: Self.north(0.11),
-                                               thresholdMetres: 0.1) == .publish)
+                                               thresholdMeters: 0.1) == .publish)
 
         let decision = MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
                                                       current: Self.north(0.11),
-                                                      thresholdMetres: 0.5)
+                                                      thresholdMeters: 0.5)
         if case .withinThreshold(let moved) = decision {
             #expect(abs(moved - 0.11) < 0.001)
         } else {
@@ -399,7 +399,7 @@ struct SyncStatusAndAvailabilityTests {
             enabled: true,
             previous: Self.state(Self.baseLat, Self.baseLon, signature: #"{"battery":87}"#),
             current: Self.state(Self.baseLat, Self.baseLon, signature: #"{"battery":86}"#),
-            thresholdMetres: 50) == .publish)
+            thresholdMeters: 50) == .publish)
     }
 
     /// The first run after a launch or a reconnect sends everything: retained discovery is
@@ -408,7 +408,7 @@ struct SyncStatusAndAvailabilityTests {
     func firstRunAlwaysPublishes() {
         #expect(MQTTClient.suppressionDecision(enabled: true, previous: nil,
                                                current: Self.north(0),
-                                               thresholdMetres: 5) == .publish)
+                                               thresholdMeters: 5) == .publish)
     }
 
     /// Timestamps move whenever Apple rewrites a record, so leaving them in the exact

@@ -212,7 +212,7 @@ actor CacheDecryptor {
     /// would send a user away from the actual cause.
     enum LocationOutcome: Equatable {
         /// A position was parsed. Carries what Apple said about it, verbatim.
-        case located(positionType: String?, accuracyMetres: Double?, ageHours: Double?)
+        case located(positionType: String?, accuracyMeters: Double?, ageHours: Double?)
         /// Apple holds a Find My network sighting that was not published, because it
         /// is flagged old and publishing it would move the entity into a wrong zone.
         case cachedSightingDeclined(ageHours: Double?)
@@ -232,7 +232,7 @@ actor CacheDecryptor {
 
         if let source = positionSource(for: device) {
             return .located(positionType: (source["positionType"] as? String).nonNullish,
-                            accuracyMetres: source["horizontalAccuracy"] as? Double,
+                            accuracyMeters: source["horizontalAccuracy"] as? Double,
                             ageHours: ageHours(source["timeStamp"]))
         }
         if let sighting = device["crowdSourcedLocation"] as? [String: Any],
@@ -251,7 +251,7 @@ actor CacheDecryptor {
     /// `location` always wins when present — it is the fresher of the two. A
     /// `crowdSourcedLocation` rescues the record only when Apple flags it **not old**,
     /// and that guard is the whole safety of this. A sighting sitting behind a working
-    /// primary location reads old (19 to 244 hours, sometimes hundreds of kilometres
+    /// primary location reads old (19 to 244 hours, sometimes hundreds of kilometers
     /// away), while a record with no primary at all reads fresh. Home Assistant
     /// computes zone state from the coordinates and ignores `is_old`, so publishing a
     /// stale sighting would move an entity into the wrong zone and fire automations.
@@ -414,7 +414,7 @@ actor CacheDecryptor {
             //
             // A negative `verticalAccuracy` is CoreLocation's own way of saying the
             // altitude is invalid, and a crowdsourced fix carries -1 for both. Passing
-            // them through hands a user a plausible-looking metre reading that means
+            // them through hands a user a plausible-looking meter reading that means
             // "unavailable" — the sign is the test, never the altitude's own value,
             // since a real altitude can be negative.
             let verticalAccuracy = loc["verticalAccuracy"] as? Double

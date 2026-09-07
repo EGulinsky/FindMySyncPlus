@@ -9,10 +9,28 @@ struct AboutView: View {
         Image(nsImage: NSApplication.shared.applicationIconImage)
     }
 
+    /// `Version 1.5b (0423d49)`.
+    ///
+    /// The commit in preference to `CFBundleVersion`, which has read a hardcoded 1 since
+    /// the project was created and so answered nothing. `build.sh` passes `GIT_COMMIT` and
+    /// Info.plist substitutes it; a build that does not pass one leaves the key empty and
+    /// this falls back to the build number rather than showing a gap.
+    ///
+    /// **Not a build phase, deliberately.** A script reading `git` cannot work here:
+    /// `ENABLE_USER_SCRIPT_SANDBOXING` is on, and in a worktree the real git directory sits
+    /// outside `SRCROOT` entirely. Turning that off for a version string is not a trade
+    /// worth making, so the value is passed in instead.
+    ///
+    /// A trailing `+` means the tree had uncommitted changes when it was built, which is
+    /// the difference between "you are running this commit" and "you are running something
+    /// like it". That question came up repeatedly while testing and neither of us could
+    /// answer it from the app.
     private var versionString: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
         let build = Bundle.main.object(forInfoDictionaryKey: kCFBundleVersionKey as String) as? String ?? "—"
-        return "Version \(short) (\(build))"
+        let commit = Bundle.main.object(forInfoDictionaryKey: "GitCommit") as? String
+        let stamped = (commit?.isEmpty == false) ? commit : nil
+        return "Version \(short) (\(stamped ?? build))"
     }
 
     // Subtle card used for sections to match app styling

@@ -59,7 +59,7 @@ struct GroupPositionAttributesTests {
                         child("Left Bud", lat: 43.05985, lon: -77.6425)]) == "together")
     }
 
-    /// Several hundred metres against a 50 m combined radius.
+    /// Several hundred meters against a 50 m combined radius.
     @Test("a piece beyond the combined accuracy reads separated")
     func separated() {
         #expect(status([child("Case", lat: 43.0598, lon: -77.6425),
@@ -75,7 +75,7 @@ struct GroupPositionAttributesTests {
     }
 
     /// Poor accuracy widens the circles, so the same distance stops being a disagreement.
-    /// That is the point of testing against the radii rather than a fixed metre count.
+    /// That is the point of testing against the radii rather than a fixed meter count.
     @Test("the threshold scales with reported accuracy")
     func thresholdScalesWithAccuracy() {
         #expect(status([child("Case", lat: 43.0598, lon: -77.6425, accuracy: 25),
@@ -97,7 +97,7 @@ struct GroupPositionAttributesTests {
     // MARK: - comparability, which is about the pair rather than either record
 
     /// Fixes from different refresh cycles describe different moments. Several hundred
-    /// metres between them says where a piece *was*, not that it is elsewhere now.
+    /// meters between them says where a piece *was*, not that it is elsewhere now.
     @Test("positions from different refresh cycles are not comparable")
     func gapBeyondIntervalIsUnknown() {
         #expect(status([child("Case", lat: 43.0598, lon: -77.6425),

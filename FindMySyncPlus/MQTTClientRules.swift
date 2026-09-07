@@ -111,7 +111,7 @@ extension MQTTClient {
         let prefix: String
         let iso: ISO8601DateFormatter
         let skipRepeats: Bool
-        let minimumMovementMetres: Double
+        let minimumMovementMeters: Double
     }
 
     // MARK: - Suppressing a position that has not meaningfully moved
@@ -162,18 +162,18 @@ extension MQTTClient {
         jsonString(attrs.filter { !volatileAttributeKeys.contains($0.key) })
     }
 
-    /// Metres between two coordinates.
+    /// Meters between two coordinates.
     ///
     /// Equirectangular rather than haversine: at the distances that decide this — under a
-    /// few metres — the two agree far beyond the precision of the inputs, and this one can
+    /// few meters — the two agree far beyond the precision of the inputs, and this one can
     /// be read at a glance. A degree of latitude is ~111,320 m everywhere; a degree of
     /// longitude shrinks by the cosine of the latitude, which is the only correction needed.
-    nonisolated static func metresBetween(_ fromLat: Double, _ fromLon: Double,
+    nonisolated static func metersBetween(_ fromLat: Double, _ fromLon: Double,
                                           _ toLat: Double, _ toLon: Double) -> Double {
-        let metresPerDegreeLatitude = 111_320.0
-        let northing = (toLat - fromLat) * metresPerDegreeLatitude
+        let metersPerDegreeLatitude = 111_320.0
+        let northing = (toLat - fromLat) * metersPerDegreeLatitude
         let meanLatitude = ((fromLat + toLat) / 2) * .pi / 180
-        let easting = (toLon - fromLon) * metresPerDegreeLatitude * cos(meanLatitude)
+        let easting = (toLon - fromLon) * metersPerDegreeLatitude * cos(meanLatitude)
         return (northing * northing + easting * easting).squareRoot()
     }
 
@@ -193,16 +193,16 @@ extension MQTTClient {
     nonisolated static func suppressionDecision(enabled: Bool,
                                                 previous: PublishedState?,
                                                 current: PublishedState,
-                                                thresholdMetres: Double) -> SuppressionDecision {
+                                                thresholdMeters: Double) -> SuppressionDecision {
         guard enabled, let previous else { return .publish }
 
         // Any real attribute change — battery, charging, separation — publishes however
         // wide the threshold. Only the position is allowed to be approximately equal.
         guard previous.signature == current.signature else { return .publish }
 
-        let moved = metresBetween(previous.latitude, previous.longitude,
+        let moved = metersBetween(previous.latitude, previous.longitude,
                                   current.latitude, current.longitude)
         if moved == 0 { return .identical }
-        return moved <= thresholdMetres ? .withinThreshold(moved) : .publish
+        return moved <= thresholdMeters ? .withinThreshold(moved) : .publish
     }
 }

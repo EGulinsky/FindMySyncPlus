@@ -92,11 +92,11 @@ extension SyncEngine {
     /// `ownedDeviceLocation` are the observed values, and an unmapped one must stay
     /// visible rather than be folded into a default.
     nonisolated static func fixDescription(_ type: String?,
-                                           _ accuracyMetres: Double?,
+                                           _ accuracyMeters: Double?,
                                            _ ageHours: Double?) -> String {
         var parts: [String] = []
         if let type { parts.append("type=\(type)") }
-        if let accuracyMetres { parts.append(String(format: "acc=%.1fm", accuracyMetres)) }
+        if let accuracyMeters { parts.append(String(format: "acc=%.1fm", accuracyMeters)) }
         if let ageHours { parts.append("age=\(Self.ageDescription(ageHours))") }
         return parts.isEmpty ? "no detail reported" : parts.joined(separator: " ")
     }

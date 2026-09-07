@@ -165,7 +165,7 @@ final class CacheDecryptorTests: XCTestCase {
     /// A crowdsourced fix carries `altitude: -1` and `verticalAccuracy: -1`, which are
     /// Apple's "unavailable" sentinels rather than measurements. CoreLocation's own
     /// contract is that a negative `verticalAccuracy` invalidates the altitude, so
-    /// publishing -1 hands a user a plausible-looking metre reading that means nothing.
+    /// publishing -1 hands a user a plausible-looking meter reading that means nothing.
     ///
     /// Seen live in Home Assistant on an AirPods group located only by the Find My
     /// network: `Altitude -1`, `Vertical accuracy -1`.

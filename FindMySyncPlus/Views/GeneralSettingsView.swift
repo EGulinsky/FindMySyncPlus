@@ -18,12 +18,12 @@ struct GeneralSettingsView: View {
     private static let minIntervalMinutes = 1
     private static let maxIntervalMinutes = 180
     // Capped at 50 rather than 100 so the dial cannot be set somewhere that hides movement
-    // across a property. Measured need: recompute noise is sub-millimetre and positioning
+    // across a property. Measured need: recompute noise is sub-millimeter and positioning
     // wobble reaches 1.4 m, so the useful range is roughly 0.1 m to 5 m.
     private static let minMovement: Double = 0
     private static let maxMovement: Double = 50
     private static let movementStep: Double = 0.5
-    private static let metresFormatter: NumberFormatter = {
+    private static let metersFormatter: NumberFormatter = {
         let nf = NumberFormatter()
         nf.numberStyle = .decimal
         nf.minimum = 0
@@ -203,19 +203,19 @@ struct GeneralSettingsView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     (Text("Minimum movement ")
                         .font(.body)
-                     + Text("(metres)").foregroundStyle(.secondary))
+                     + Text("(meters)").foregroundStyle(.secondary))
                         .foregroundStyle(movementEnabled ? .primary : .secondary)
 
                     Spacer()
 
-                    TextField("", value: $settings.minimumMovementMetres,
-                              formatter: Self.metresFormatter)
+                    TextField("", value: $settings.minimumMovementMeters,
+                              formatter: Self.metersFormatter)
                         .multilineTextAlignment(.trailing)
                         .frame(width: 64)
                         .textFieldStyle(.roundedBorder)
                         .disabled(!movementEnabled)
 
-                    Stepper("", value: $settings.minimumMovementMetres,
+                    Stepper("", value: $settings.minimumMovementMeters,
                             in: Self.minMovement...Self.maxMovement,
                             step: Self.movementStep)
                         .labelsHidden()

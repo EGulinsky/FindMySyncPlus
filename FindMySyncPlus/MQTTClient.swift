@@ -185,6 +185,35 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
     // MARK: - Availability
 
+    /// Publish the discovery configs that belong to the app rather than to any tracker.
+    ///
+    /// **At connect, not at the end of a run.** These need no run data, and a sync can
+    /// return early half a dozen ways — sources disabled, pre-flight failure, no usable
+    /// cache. Published from the run, a machine whose syncs fail would get a retained
+    /// `online` on the availability topic and no Connected sensor reading it.
+    ///
+    /// The Connected sensor carries no state of its own: the topic it reads is already
+    /// retained, so it resolves the moment Home Assistant subscribes.
+    private func publishAppEntityDiscovery() {
+        guard !publishedAppEntities, let client, let settings else { return }
+        let prefix = settings.mqttTopicPrefix
+
+        publishJSON(client: client,
+                    topic: Self.statusDiscoveryTopic(),
+                    payload: Self.statusPayload(topicPrefix: prefix),
+                    retain: true)
+        publishJSON(client: client,
+                    topic: Self.connectedDiscoveryTopic(),
+                    payload: Self.connectedPayload(topicPrefix: prefix),
+                    retain: true)
+        settleRefreshButton(client: client,
+                            enabled: settings.enableRefreshTrigger,
+                            prefix: prefix)
+        publishedAppEntities = true
+        logger?.info("MQTT discovery published for sensor.\(Self.statusDevId) "
+                     + "and binary_sensor.\(Self.connectedSensorId)")
+    }
+
     /// Publish the app-level availability state, retained.
     ///
     /// Retained on purpose: a subscriber that connects later must learn the current
@@ -300,7 +329,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         let iso = ISO8601DateFormatter()
         let cycle = AttributeCycle(prefix: prefix, iso: iso,
                                    skipRepeats: settings.skipRepeatedLocations,
-                                   minimumMovementMetres: settings.minimumMovementMetres)
+                                   minimumMovementMeters: settings.minimumMovementMeters)
 
         drainRetiredDevIds(client: client, aliasByUUID: aliasByUUID,
                            settings: settings, logger: logger, prefix: prefix)
@@ -358,7 +387,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
             var reasons = ["\(identicalCount) identical"]
             if withinThresholdCount > 0 {
                 reasons.append(String(format: "%d within %.1f m",
-                                      withinThresholdCount, settings.minimumMovementMetres))
+                                      withinThresholdCount, settings.minimumMovementMeters))
             }
             logger.info("MQTT: \(skipped) entit\(skipped == 1 ? "y" : "ies") not republished "
                         + "(\(reasons.joined(separator: ", ")))")
@@ -396,13 +425,13 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         switch Self.suppressionDecision(enabled: skipRepeats,
                                         previous: lastPublishedAttributes[devId],
                                         current: state,
-                                        thresholdMetres: cycle.minimumMovementMetres) {
+                                        thresholdMeters: cycle.minimumMovementMeters) {
         case .identical:
             logger.debug("[\(devId)] unchanged since the last publish — skipped")
             return .skippedIdentical
         case .withinThreshold(let moved):
             logger.debug(String(format: "[%@] moved %.2f m, within %.1f m — skipped",
-                                devId, moved, cycle.minimumMovementMetres))
+                                devId, moved, cycle.minimumMovementMeters))
             return .skippedWithinThreshold
         case .publish:
             break
@@ -431,32 +460,10 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     func publishStatus(_ report: SyncStatusReport,
                        lastSuccessfulSync: Date?,
                        prefix: String,
-                       refreshTriggerEnabled: Bool,
                        iso: ISO8601DateFormatter) {
         guard connectionState == .connected, let client else {
             logger?.debug("MQTT: not connected; status entity not published this run")
             return
-        }
-
-        // Rides here because this is the one place per run that is known to have a live
-        // connection and runs after the trackers, so the app-level entities land together.
-        settleRefreshButton(client: client, enabled: refreshTriggerEnabled, prefix: prefix)
-
-        if !publishedAppEntities {
-            publishJSON(client: client,
-                        topic: Self.statusDiscoveryTopic(),
-                        payload: Self.statusPayload(topicPrefix: prefix),
-                        retain: true)
-            // Published beside the status entity because both are app-level singletons
-            // with the same lifetime. It carries no state of its own: the availability
-            // topic it reads is already retained, so it resolves the moment HA subscribes.
-            publishJSON(client: client,
-                        topic: Self.connectedDiscoveryTopic(),
-                        payload: Self.connectedPayload(topicPrefix: prefix),
-                        retain: true)
-            publishedAppEntities = true
-            logger?.info("MQTT discovery published for sensor.\(Self.statusDevId) "
-                         + "and binary_sensor.\(Self.connectedSensorId)")
         }
 
         if let lastSuccessfulSync {
@@ -468,6 +475,12 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
                     topic: Self.statusAttributesTopic(prefix: prefix),
                     payload: report.attributes,
                     retain: true)
+
+        // Debug, not info: the run summary already carries these counts at info, and at 288
+        // runs a day a second line saying the same thing is buffer churn. What this adds is
+        // confirmation the status topics were written, which only matters when they were not.
+        logger?.debug("MQTT: sync status published — \(report.published) published, "
+                      + "\(report.skippedUnchanged) skipped")
     }
 
     // MARK: - Re-registration
@@ -854,9 +867,10 @@ extension MQTTClient: CocoaMQTTDelegate {
                 self.publishedAppEntities = false
                 self.settledRefreshButton = false
                 self.lastPublishedAttributes.removeAll()
+                self.logger?.info("MQTT connected (discovery will re-publish)")
                 self.publishAvailability(Self.availabilityOnline)
                 self.subscribeToRefreshTopic()
-                self.logger?.info("MQTT connected (discovery will re-publish)")
+                self.publishAppEntityDiscovery()
             } else {
                 self.logger?.error("MQTT connection rejected: \(ackDesc)")
                 self.connectionState = .disconnected

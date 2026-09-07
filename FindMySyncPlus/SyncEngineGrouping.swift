@@ -38,7 +38,7 @@ extension SyncEngine {
     /// **Distance is geometry, not a tuned constant.** Two positions disagree when they are
     /// further apart than the sum of their accuracy radii — their error circles do not
     /// overlap, so no single point satisfies both. That scales on its own when Apple's
-    /// accuracy is poor, where a fixed metre threshold would not.
+    /// accuracy is poor, where a fixed meter threshold would not.
     ///
     /// Measured margin is wide: pieces in one case sit 5–6 m apart with 24–30 m accuracy
     /// each, roughly 5 m against a 54 m sum.
@@ -79,7 +79,7 @@ extension SyncEngine {
                 let a = dated[i], b = dated[j]
                 guard abs(a.at.timeIntervalSince(b.at)) <= syncInterval else { continue }
                 compared = true
-                if Self.metresBetween(a.point, b.point) > a.point.accuracy + b.point.accuracy {
+                if Self.metersBetween(a.point, b.point) > a.point.accuracy + b.point.accuracy {
                     return "separated"
                 }
             }
@@ -106,9 +106,9 @@ extension SyncEngine {
         return children.first { $0.name == "Case" } ?? freshest
     }
 
-    /// Great-circle distance in metres. Haversine, which is accurate well below the scale
+    /// Great-circle distance in meters. Haversine, which is accurate well below the scale
     /// anything here cares about.
-    nonisolated static func metresBetween(_ a: DevicePoint, _ b: DevicePoint) -> Double {
+    nonisolated static func metersBetween(_ a: DevicePoint, _ b: DevicePoint) -> Double {
         let earthRadius = 6_371_000.0
         let dLat = (b.latitude - a.latitude) * .pi / 180
         let dLon = (b.longitude - a.longitude) * .pi / 180

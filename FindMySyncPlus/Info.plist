@@ -18,6 +18,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>GitCommit</key>
+	<string>$(GIT_COMMIT)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 </dict>
