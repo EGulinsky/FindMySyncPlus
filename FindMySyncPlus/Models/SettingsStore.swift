@@ -144,6 +144,18 @@ final class SettingsStore: ObservableObject {
     @AppStorage("mqttUsername") var mqttUsername: String = ""
     @AppStorage("mqttTopicPrefix") var mqttTopicPrefix: String = "findmysyncplus/"
 
+    /// This install's MQTT client id, generated once and reused forever.
+    ///
+    /// Empty until the first connection, which fills it in via
+    /// `MQTTClient.resolveClientId`. It was `UUID().uuidString.prefix(8)` built fresh
+    /// on every launch, so the broker saw a new client each time: connection logs,
+    /// ACLs and `$SYS` counters could not be tied to this install, and a broker that
+    /// retains client state accumulated a dead entry per launch.
+    ///
+    /// **Per-install, never shared.** A value stable across installs would make two
+    /// Macs running FMS+ fight over one broker session, each disconnecting the other.
+    @AppStorage("mqttClientId") var mqttClientId: String = ""
+
     @Published var mqttPassword: String = "" {
         didSet {
             _ = Keychain.setString(mqttPassword, for: .mqttPassword)
@@ -169,6 +181,21 @@ final class SettingsStore: ObservableObject {
     @AppStorage("enableFriends") var enableFriends: Bool = false
     @AppStorage("maxUUIDsPerAlias") var maxUUIDsPerAlias: Int = 2
     @AppStorage("autoLearnUUIDs") var autoLearnUUIDs: Bool = false
+
+    /// Publish a tracker only when Find My has something new for it.
+    ///
+    /// Off by default and recommended in the docs — the same treatment as
+    /// `autoStartSchedulerOnLaunch`, `enableFriends` and `autoLearnUUIDs`, which is
+    /// this app's convention for a setting most users want but nobody should get
+    /// silently. It is a behavior change for everyone currently relying on the
+    /// refresh: with it on, Home Assistant's own "last updated" starts meaning "Find
+    /// My actually saw this device" rather than "the sync ran".
+    ///
+    /// **MQTT only.** The attributes topic is published retained, so a suppressed
+    /// entity still gets its last value when Home Assistant restarts and resubscribes.
+    /// `device_tracker/see` has no retained equivalent, so a REST user with this on
+    /// would come back from a restart with entities unknown until something moved.
+    @AppStorage("skipRepeatedLocations") var skipRepeatedLocations: Bool = false
 
     // Menu Bar options
 

@@ -15,6 +15,71 @@ extension MQTTClient {
         "homeassistant/device_tracker/\(devId)/config"
     }
 
+    // MARK: - App-level topics
+
+    /// One availability topic for the whole app, referenced by every discovery
+    /// payload. Nothing per-device is needed.
+    ///
+    /// **A topic either carries a value or has children.** This is a leaf and
+    /// `status/` is a namespace, which is why availability is not at `<prefix>status`
+    /// as upstream PR #50 has it — that would hold `"online"` while
+    /// `<prefix>status/state` held a timestamp. The topic is retained and every
+    /// entity's config points at it, so renaming it later means clearing the old one
+    /// by hand and republishing all of them.
+    ///
+    /// No device can collide: `DeviceAlias.entityID` forces the `findmy_` prefix, so
+    /// an app-level topic is always distinct however an alias is named.
+    nonisolated static func availabilityTopic(prefix: String) -> String {
+        "\(prefix)availability"
+    }
+
+    /// HA's own defaults for `payload_available` / `payload_not_available`, so the
+    /// discovery payloads need neither key.
+    nonisolated static let availabilityOnline = "online"
+    nonisolated static let availabilityOffline = "offline"
+
+    nonisolated static func statusStateTopic(prefix: String) -> String {
+        "\(prefix)status/state"
+    }
+
+    nonisolated static func statusAttributesTopic(prefix: String) -> String {
+        "\(prefix)status/attributes"
+    }
+
+    nonisolated static let statusDevId = "findmysyncplus_status"
+
+    nonisolated static func statusDiscoveryTopic() -> String {
+        "homeassistant/sensor/\(statusDevId)/config"
+    }
+
+    /// The sync status entity: last successful sync as the state, the run's counts and
+    /// the app's own health as attributes.
+    ///
+    /// **This is what makes skipping legible.** Availability answers *is the app
+    /// alive*; it does not answer *did it look at my tracker and decide nothing had
+    /// changed*. Without the counts, "working as intended" and "broken" look
+    /// identical from Home Assistant.
+    ///
+    /// The one singleton discovery payload — it is not a devId, so retired-alias
+    /// cleanup never sweeps it (`tombstonesToPublish` works from an explicit list).
+    nonisolated static func statusPayload(topicPrefix: String) -> [String: Any] {
+        [
+            "name": "Sync status",
+            "unique_id": statusDevId,
+            "default_entity_id": "sensor.\(statusDevId)",
+            "state_topic": statusStateTopic(prefix: topicPrefix),
+            "json_attributes_topic": statusAttributesTopic(prefix: topicPrefix),
+            "availability_topic": availabilityTopic(prefix: topicPrefix),
+            "device_class": "timestamp",
+            "device": [
+                "identifiers": ["findmysyncplus"],
+                "name": "FindMySync+",
+                "manufacturer": "Apple",
+                "model": "Find My"
+            ]
+        ]
+    }
+
     /// The auto-discovery config. Extracted from `post()` so it can be asserted on
     /// without a broker: HA removed `object_id` in Core 2026.4 and now silently
     /// ignores it, which was invisible here for four months because this payload
@@ -36,6 +101,11 @@ extension MQTTClient {
             // the resolved ID we log truthful.
             "default_entity_id": DeviceAlias.haEntityID(forDevId: devId),
             "json_attributes_topic": "\(topicPrefix)\(devId)/attributes",
+            // Without this a tracker holds its last known position forever when the
+            // Mac goes away, with nothing to say the app stopped. Existing installs
+            // pick it up at the next rediscovery, which a launch already does — no
+            // migration and no republish pass.
+            "availability_topic": availabilityTopic(prefix: topicPrefix),
             "source_type": "gps",
             "device": [
                 "identifiers": ["findmysyncplus"],
@@ -68,6 +138,7 @@ extension MQTTClient {
             "unique_id": "\(devId)_battery",
             "default_entity_id": "sensor.\(haSlug(devId))_battery",
             "state_topic": attributesTopic(forDevId: devId, prefix: topicPrefix),
+            "availability_topic": availabilityTopic(prefix: topicPrefix),
             // Guarded because the attributes payload omits `battery` whenever Apple
             // supplies none, which is transient rather than per-device. Unguarded,
             // every such publish makes HA log a template warning. Rendering empty is

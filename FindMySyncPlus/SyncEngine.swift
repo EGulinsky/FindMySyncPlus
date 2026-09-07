@@ -197,6 +197,10 @@ final class SyncEngine {
 
         logRunComplete(t0: t0, plan: plan, postSummary: postSummary, dryRun: dryRun,
                        app: app, logger: logger)
+
+        publishStatusEntity(StatusRun(startedAt: t0, metrics: plan.metrics,
+                                      postSummary: postSummary, dryRun: dryRun),
+                            settings: settings, logger: logger, app: app)
     }
 
     // MARK: - Run pipeline helpers

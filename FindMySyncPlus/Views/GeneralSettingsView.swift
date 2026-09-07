@@ -32,6 +32,7 @@ struct GeneralSettingsView: View {
             VStack(spacing: 16) {
                 schedulerCard
                 findMyCard
+                publishingCard
                 sourcesCard
                 deviceManagerCard
             }
@@ -130,6 +131,45 @@ struct GeneralSettingsView: View {
                         .labelsHidden()
                         .disabled(!settings.autoLaunchKillFindMy)
                 }
+            }
+        }
+    }
+
+    /// MQTT publishes its attributes topic retained, so a skipped entity still gets its
+    /// last value when Home Assistant restarts and resubscribes. REST has no retained
+    /// equivalent — a REST user with this on would come back from a restart with
+    /// entities unknown until something actually moved — so the row reads off there,
+    /// leaving the stored preference alone for anyone who switches transport later.
+    private var isMQTT: Bool { settings.transportMode == .mqtt }
+
+    private var publishingCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("Publishing")
+                        .font(.title3).fontWeight(.semibold)
+
+                    InfoTip(message: """
+                        Control what reaches Home Assistant when Find My \
+                        reports the same position again.
+                        """)
+                    Spacer()
+                }
+
+                SettingsToggleRow(
+                    label: "Skip repeated locations",
+                    isOn: isMQTT ? $settings.skipRepeatedLocations : .constant(false),
+                    disabled: !isMQTT,
+                    qualifier: isMQTT ? nil : "MQTT only"
+                )
+
+                Text("""
+                    Publish a tracker only when Find My has something new for it. \
+                    Home Assistant's own "last updated" then means the device was \
+                    actually seen, rather than that the sync ran.
+                    """)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
     }

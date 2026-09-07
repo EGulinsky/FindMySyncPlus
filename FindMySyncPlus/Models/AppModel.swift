@@ -19,6 +19,14 @@ final class AppModel: NSObject, ObservableObject {
     @Published var currentRunKind: RunKind = .none
     @Published var isRunning = false
     @Published private(set) var lastRun: Date?
+    /// The last run that completed its publish phase without a fatal error.
+    ///
+    /// Distinct from `lastRun`, which advances for any run at all. This is what the
+    /// status entity carries as its state, and a run that failed must leave it alone —
+    /// a failure is exactly when someone needs to see how long ago the last good one
+    /// was. A run that published nothing because every position was unchanged is a
+    /// success, not a failure.
+    @Published private(set) var lastSuccessfulSync: Date?
     @Published private(set) var nextRun: Date?
     @Published private(set) var lastRunHadFatalError: Bool = false
     @Published var lastRunHadWarnings: Bool = false
@@ -54,9 +62,15 @@ final class AppModel: NSObject, ObservableObject {
     /// Set on `willSleep`, cleared on `didWake`. Non-nil means we have seen a sleep with no
     /// matching wake.
     private var sleepStartedAt: Date?
-    /// Only restart on wake what we stopped on sleep — a scheduler the user stopped stays
-    /// stopped.
-    private var pausedBySleep = false
+    /// The most recent `willSleep`, kept after the wake clears `sleepStartedAt`, so a run
+    /// that a sleep landed inside can still say so once it finishes.
+    private var lastSleepAt: Date?
+
+    /// The message behind the most recent fatal error, or `nil` if the last run was clean.
+    ///
+    /// The status entity publishes it: `last_error` in Home Assistant is the difference
+    /// between a user seeing what went wrong and filing a log line nobody can act on.
+    @Published private(set) var lastErrorMessage: String?
 
     override init() {
         super.init()
@@ -89,7 +103,7 @@ final class AppModel: NSObject, ObservableObject {
             .store(in: &cancellables)
         logger.errorSignal
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.handleFatalError() }
+            .sink { [weak self] message in self?.handleFatalError(message) }
             .store(in: &cancellables)
         logger.warningSignal
             .receive(on: RunLoop.main)
@@ -276,38 +290,46 @@ final class AppModel: NSObject, ObservableObject {
 
     // MARK: - Scheduler
 
-    // A sleeping Mac defers our timer to roughly 15 minutes and services it during dark
-    // wakes, so runs continue and publish positions nobody is refreshing. Measured on two
-    // machines; `sleep-suspension.md` §5a.
+    // Sleep is observed and reported, and changes no behavior.
     //
-    // Dark wakes post no `didWake`, which is what makes stopping on `willSleep` safe: we
-    // stay stopped until the machine genuinely wakes.
+    // The scheduler used to stop on `willSleep`. That was right for the laptop it was
+    // built for and wrong everywhere else: it stopped an always-on VM whose guest sleeps
+    // on idle, it suppressed genuinely fresh data — a suspended Mac updates its cache
+    // *partially*, so some records really do advance — and it reset the Statistics on
+    // every wake. What replaces it is `slept_during_run` on the status entity: a run of
+    // 961 seconds looks broken on its own and is not, and passing the signal through lets
+    // the user draw that conclusion instead of us deciding for them.
+    //
+    // Republishing the same position through a sleep is the complaint underneath, and
+    // that is what skipping repeated locations answers.
     private func observeSleepWake() {
         guard sleepObservers.isEmpty else { return }
-        let center = NSWorkspace.shared.notificationCenter
-        let register = { (name: Notification.Name, handler: @escaping @MainActor () -> Void) in
-            center.addObserver(forName: name, object: nil, queue: .main) { _ in
-                MainActor.assumeIsolated { handler() }
-            }
-        }
+        let workspace = NSWorkspace.shared.notificationCenter
         sleepObservers = [
-            register(NSWorkspace.willSleepNotification) { [weak self] in self?.noteSleep() },
-            register(NSWorkspace.didWakeNotification) { [weak self] in self?.noteWake() }
+            observe(workspace, NSWorkspace.willSleepNotification) { [weak self] in self?.noteSleep() },
+            observe(workspace, NSWorkspace.didWakeNotification) { [weak self] in self?.noteWake() },
+            // Availability's other half. The broker discards the will on a clean quit, so
+            // without this the retained `online` outlives the app and every entity reads
+            // available forever.
+            observe(.default, NSApplication.willTerminateNotification) { [weak self] in
+                self?.noteTermination()
+            }
         ]
     }
 
-    private func noteSleep() {
-        sleepStartedAt = Date()
-        guard isRunning else {
-            logger?.info("System going to sleep")
-            return
+    private func observe(_ center: NotificationCenter,
+                         _ name: Notification.Name,
+                         handler: @escaping @MainActor () -> Void) -> NSObjectProtocol {
+        center.addObserver(forName: name, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { handler() }
         }
-        pausedBySleep = true
-        // Logged before `stop()` so the reason precedes the disconnect it causes. An
-        // in-flight run is left to finish — a sleep landing mid-run does not stop that run
-        // completing, and cancelling the timer only prevents the next one.
-        logger?.info("System going to sleep — stopping the scheduler")
-        stop()
+    }
+
+    private func noteSleep() {
+        let now = Date()
+        sleepStartedAt = now
+        lastSleepAt = now
+        logger?.info("System going to sleep")
     }
 
     private func noteWake() {
@@ -315,13 +337,22 @@ final class AppModel: NSObject, ObservableObject {
         // nothing about how long rather than inventing a duration.
         let slept = sleepStartedAt.map { " after \(Int(Date().timeIntervalSince($0) / 60))m" } ?? ""
         sleepStartedAt = nil
-        guard pausedBySleep else {
-            logger?.info("System woke\(slept)")
-            return
-        }
-        pausedBySleep = false
-        logger?.info("System woke\(slept) — starting the scheduler")
-        start()
+        logger?.info("System woke\(slept)")
+    }
+
+    private func noteTermination() {
+        guard let settings, settings.transportMode == .mqtt else { return }
+        syncEngine.mqtt.publishOfflineForTermination()
+    }
+
+    /// Whether a sleep landed inside a run that began at `runStartedAt`.
+    ///
+    /// Reported rather than acted on. Measured on the machine behind #28: runs of 909,
+    /// 961 and 965 seconds, and a 2-minute timer deferred to roughly 15 minutes. Those
+    /// are the numbers a support thread starts from, and this is what answers it.
+    func sleptDuring(runStartedAt: Date) -> Bool {
+        guard let lastSleepAt else { return false }
+        return lastSleepAt >= runStartedAt
     }
 
     func start() {
@@ -383,10 +414,12 @@ final class AppModel: NSObject, ObservableObject {
 
                 if !Task.isCancelled {
                     if self.sleepStartedAt != nil {
-                        // Should be unreachable: the scheduler is stopped on `willSleep`.
-                        // If this appears, the pause did not hold. `.warn` rather than
-                        // `.error` — an `.error` would stop the scheduler outright.
-                        self.logger?.warn("Run fired while the system is believed asleep")
+                        // Ordinary now that the scheduler no longer stops on `willSleep`:
+                        // macOS defers the timer and services it during a dark wake. Kept
+                        // at `.debug` because it explains an odd-looking gap in the log,
+                        // and never at `.warn` — a warning here would mark every such run
+                        // as having had one.
+                        self.logger?.debug("Scheduled run firing while the system is asleep")
                     }
                     await self.syncEngine.run(kind: .scheduled, dryRun: false)
                 }
@@ -412,10 +445,15 @@ final class AppModel: NSObject, ObservableObject {
         currentRunMode = dryRun ? .dry : .normal
         lastRunHadWarnings = false
         lastRunHadFatalError = false
+        lastErrorMessage = nil
     }
 
     func markRunFinished() {
         lastRun = Date()
+    }
+
+    func markSyncSucceeded(at date: Date = Date()) {
+        lastSuccessfulSync = date
     }
 
     func resetAfterRun() {
@@ -430,9 +468,10 @@ final class AppModel: NSObject, ObservableObject {
 
     // MARK: - Error/warning handlers
 
-    private func handleFatalError() {
+    private func handleFatalError(_ message: String) {
         stop()
         self.lastRunHadFatalError = true
+        self.lastErrorMessage = message
     }
 
     private func handleWarnings() {

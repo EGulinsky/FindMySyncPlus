@@ -29,6 +29,25 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// the active connection. Compared as a token because `CocoaMQTT` is not `Sendable`.
     private var activeClientToken: ObjectIdentifier?
 
+    /// The availability topic this connection registered its will against.
+    ///
+    /// Held rather than recomputed so the `online` publish, the will and the `offline`
+    /// on quit all name the same topic even if the user edits `mqttTopicPrefix`
+    /// mid-session — otherwise a retained `online` would be stranded under the old
+    /// prefix with nothing left to clear it.
+    private var availabilityTopicInUse: String?
+
+    /// Set once the status entity's discovery config has gone out this session, the
+    /// same per-session gate the trackers use.
+    private var publishedStatusDiscovery = false
+
+    /// Last published attributes payload per devId, for suppressing repeats.
+    ///
+    /// Cleared on reconnect beside `publishedDiscoveryIds`: retained discovery is
+    /// republished then, and a suppression map that survived would leave an entity
+    /// with a fresh config and no state behind it.
+    private var lastPublishedAttributes: [String: String] = [:]
+
     /// When the in-flight attempt started, so a stalled one is replaced rather than
     /// leaving the client wedged in `.connecting`.
     private var connectingSince: Date?
@@ -64,7 +83,13 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
             return
         }
 
-        let clientId = "FindMySyncPlus-\(UUID().uuidString.prefix(8))"
+        // Generated once and persisted, so the broker sees one identity for this
+        // install rather than one per launch.
+        let clientId = Self.resolveClientId(stored: settings.mqttClientId)
+        if settings.mqttClientId != clientId {
+            settings.mqttClientId = clientId
+            logger?.info("MQTT: client id assigned for this install")
+        }
         let mqtt = CocoaMQTT(
             clientID: clientId,
             host: settings.mqttHost,
@@ -78,6 +103,15 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         }
         mqtt.keepAlive = 60
         mqtt.autoReconnect = false
+        // The last will, registered per connection: the broker publishes it if this
+        // Mac disappears without a clean DISCONNECT, so every entity referencing the
+        // topic goes unavailable instead of holding its last position forever.
+        let availabilityTopic = Self.availabilityTopic(prefix: settings.mqttTopicPrefix)
+        availabilityTopicInUse = availabilityTopic
+        mqtt.willMessage = CocoaMQTTMessage(topic: availabilityTopic,
+                                            string: Self.availabilityOffline,
+                                            qos: .qos1,
+                                            retained: true)
         if settings.mqttUseTLS {
             mqtt.enableSSL = true
             mqtt.allowUntrustCACertificate = true
@@ -107,7 +141,48 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         connectingSince = nil
         publishedDiscoveryIds.removeAll()
         publishedBatterySensorIds.removeAll()
+        publishedStatusDiscovery = false
+        lastPublishedAttributes.removeAll()
     }
+
+    // MARK: - Availability
+
+    /// Publish the app-level availability state, retained.
+    ///
+    /// Retained on purpose: a subscriber that connects later must learn the current
+    /// state rather than wait for the next transition.
+    private func publishAvailability(_ state: String) {
+        guard let client, let topic = availabilityTopicInUse else { return }
+        client.send(CocoaMQTTMessage(topic: topic, string: state, qos: .qos1, retained: true))
+    }
+
+    /// Say `offline` and disconnect, for an app that is quitting.
+    ///
+    /// **The will alone is not enough.** The broker publishes a will only when the
+    /// connection drops *without* a DISCONNECT packet; a clean quit sends one, the
+    /// will is discarded, and the retained `online` stands forever. Availability
+    /// would then cover a crash or a pulled cable and miss the ordinary case of
+    /// quitting the app.
+    ///
+    /// **The trigger is termination, not `stop()`.** The scheduler stopping is not
+    /// the app going away — publishing `offline` from there would say the app is gone
+    /// while it is sitting on screen.
+    func publishOfflineForTermination() {
+        guard connectionState == .connected, client != nil else { return }
+        publishAvailability(Self.availabilityOffline)
+        logger?.info("MQTT: published offline before quitting")
+        // The publish is queued on the socket's own queue, and the process is about to
+        // exit. `disconnect()` queues DISCONNECT behind it, so the ordering is right;
+        // what is missing is time for either to reach the wire. A short bounded spin
+        // is the whole remedy — without it the retained `online` can survive a clean
+        // quit, which is the exact case this method exists for.
+        disconnect()
+        RunLoop.current.run(until: Date().addingTimeInterval(Self.terminationFlushSeconds))
+    }
+
+    /// Long enough for a queued PUBLISH and DISCONNECT to leave the socket, short
+    /// enough that quitting still feels immediate.
+    nonisolated static let terminationFlushSeconds: TimeInterval = 0.3
 
     func ensureConnected(settings: SettingsStore) async -> Bool {
         if connectionState == .connected { return true }
@@ -179,8 +254,11 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
         var successCount = 0
         var transientCount = 0
+        var skippedUnchangedCount = 0
         let prefix = settings.mqttTopicPrefix
         let iso = ISO8601DateFormatter()
+        let cycle = AttributeCycle(prefix: prefix, iso: iso,
+                                   skipRepeats: settings.skipRepeatedLocations)
 
         drainRetiredDevIds(client: client, aliasByUUID: aliasByUUID,
                            settings: settings, logger: logger, prefix: prefix)
@@ -218,16 +296,119 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
                                          displayName: d.name.isEmpty ? alias : d.name,
                                          prefix: prefix)
 
-            // Build and publish attributes
-            let attrs = buildAttributes(for: d, iso: iso)
-            publishJSON(client: client, topic: "\(prefix)\(devId)/attributes", payload: attrs, retain: true)
-            successCount += 1
-            logger.info("[\(devId)] MQTT published")
+            switch publishAttributes(client: client, device: d, devId: devId,
+                                     cycle: cycle, logger: logger) {
+            case .published:      successCount += 1
+            case .skippedUnchanged: skippedUnchangedCount += 1
+            case .failed:         transientCount += 1
+            }
+        }
+
+        // Never silent: with skipping on, "working as intended" and "broken" look
+        // identical from the outside, and this line plus `skipped_unchanged` on the
+        // status entity are the two things that tell them apart.
+        if skippedUnchangedCount > 0 {
+            logger.info("MQTT: \(skippedUnchangedCount) entit\(skippedUnchangedCount == 1 ? "y" : "ies") "
+                        + "unchanged since the last publish, not republished")
         }
 
         return PostSummary(successCount: successCount,
                            authRejectedCount: 0,
-                           transientCount: transientCount)
+                           transientCount: transientCount,
+                           skippedUnchangedCount: skippedUnchangedCount)
+    }
+
+    /// What happened to one device's attributes this cycle.
+    ///
+    /// Three outcomes rather than a `Bool`, because a skip and a failure are opposite
+    /// things that both mean "nothing went out": one is the feature working, the other
+    /// is an entity silently going dark.
+    enum AttributePublishOutcome {
+        case published
+        case skippedUnchanged
+        case failed
+    }
+
+    /// Build and publish one device's attributes, skipping a payload identical to the
+    /// one already retained on the broker.
+    ///
+    /// The comparison is the whole payload rather than a coordinate check, and that is
+    /// only sound because `last_update` now carries the fix time instead of `Date()` —
+    /// see `buildAttributes`. A record Apple gives no timestamp for keeps the publish
+    /// time and so never matches itself, which is the safe direction: it publishes,
+    /// loudly, rather than going quiet on a record we cannot reason about.
+    /// The parts of a publish cycle that are the same for every device in it.
+    struct AttributeCycle {
+        let prefix: String
+        let iso: ISO8601DateFormatter
+        let skipRepeats: Bool
+    }
+
+    private func publishAttributes(client: MQTTPublishing,
+                                   device: DevicePoint,
+                                   devId: String,
+                                   cycle: AttributeCycle,
+                                   logger: LogStore) -> AttributePublishOutcome {
+        let (prefix, iso, skipRepeats) = (cycle.prefix, cycle.iso, cycle.skipRepeats)
+        guard let json = Self.jsonString(buildAttributes(for: device, iso: iso)) else {
+            logger.warn("[\(devId)] MQTT: attributes could not be serialized; not published")
+            return .failed
+        }
+
+        if Self.shouldSkipPublish(enabled: skipRepeats,
+                                  previous: lastPublishedAttributes[devId],
+                                  current: json) {
+            logger.debug("[\(devId)] unchanged since the last publish — skipped")
+            return .skippedUnchanged
+        }
+
+        client.send(CocoaMQTTMessage(topic: Self.attributesTopic(forDevId: devId, prefix: prefix),
+                                     string: json, qos: .qos1, retained: true))
+        lastPublishedAttributes[devId] = json
+        logger.info("[\(devId)] MQTT published")
+        return .published
+    }
+
+    // MARK: - Status entity
+
+    /// Publish the sync status entity: its discovery config once per session, then its
+    /// state and attributes.
+    ///
+    /// **Every sync, not hourly.** It is one entity against ~25, so payload cost is not
+    /// the constraint, and an hourly heartbeat cannot tell you the app died 50 minutes
+    /// ago.
+    ///
+    /// - Parameter lastSuccessfulSync: `nil` when this run published nothing, which
+    ///   leaves the previous timestamp standing rather than advancing it — the state is
+    ///   "last successful sync", and a failed run is precisely when a user must be able
+    ///   to see how long ago the last good one was.
+    func publishStatus(_ report: SyncStatusReport,
+                       lastSuccessfulSync: Date?,
+                       prefix: String,
+                       iso: ISO8601DateFormatter) {
+        guard connectionState == .connected, let client else {
+            logger?.debug("MQTT: not connected; status entity not published this run")
+            return
+        }
+
+        if !publishedStatusDiscovery {
+            publishJSON(client: client,
+                        topic: Self.statusDiscoveryTopic(),
+                        payload: Self.statusPayload(topicPrefix: prefix),
+                        retain: true)
+            publishedStatusDiscovery = true
+            logger?.info("MQTT discovery published for sensor.\(Self.statusDevId)")
+        }
+
+        if let lastSuccessfulSync {
+            client.send(CocoaMQTTMessage(topic: Self.statusStateTopic(prefix: prefix),
+                                         string: iso.string(from: lastSuccessfulSync),
+                                         qos: .qos1, retained: true))
+        }
+        publishJSON(client: client,
+                    topic: Self.statusAttributesTopic(prefix: prefix),
+                    payload: report.attributes,
+                    retain: true)
     }
 
     // MARK: - Re-registration
@@ -298,12 +479,29 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
     // MARK: - Attribute building
 
-    func buildAttributes(for device: DevicePoint, iso: ISO8601DateFormatter) -> [String: Any] {
+    /// - Parameter now: the fallback for a record Apple gave no fix time. A parameter
+    ///   only so a test can advance it: the whole point of that branch is that such a
+    ///   record keeps publishing rather than matching itself, and a fixed clock is the
+    ///   only way to show it.
+    func buildAttributes(for device: DevicePoint,
+                         iso: ISO8601DateFormatter,
+                         now: Date = Date()) -> [String: Any] {
         var attrs: [String: Any] = [
             "latitude": device.latitude,
             "longitude": device.longitude,
             "gps_accuracy": device.accuracy,
-            "last_update": iso.string(from: Date())
+            // The fix time, not the publish time.
+            //
+            // This was `Date()`, which meant Home Assistant saw an attribute change
+            // every cycle and every entity's "last updated" always read as fresh —
+            // a 43-hour-old position presented as if it had just arrived. It is also
+            // the only reason the payload was unstable per cycle, so nothing could be
+            // compared against the previous one.
+            //
+            // Falls back to now when Apple supplied no timestamp, which keeps the
+            // field present for anyone templating on it and keeps such a record
+            // publishing every cycle rather than silently matching itself.
+            "last_update": iso.string(from: device.richAttributes?.timestamp ?? now)
         ]
         // Four attributes, split by meaning rather than by Apple's key name. A single
         // raw value would be ambiguous: `batteryLevel` is a 0–1 fraction and
@@ -508,9 +706,25 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     }
 
     private func publishJSON(client: MQTTPublishing, topic: String, payload: [String: Any], retain: Bool) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8) else { return }
+        guard let json = Self.jsonString(payload) else {
+            // Was a silent `return`. A payload that cannot be serialized is an entity
+            // that never appears in Home Assistant, with nothing anywhere to say why.
+            logger?.warn("MQTT: payload for \(topic) could not be serialized; not published")
+            return
+        }
         client.send(CocoaMQTTMessage(topic: topic, string: json, qos: .qos1, retained: retain))
+    }
+
+    /// A payload as the exact string that goes on the wire.
+    ///
+    /// `sortedKeys` so two serializations of equal content are byte-identical —
+    /// without it, comparing this run's payload against the last one would depend on
+    /// dictionary ordering rather than on whether anything changed.
+    nonisolated static func jsonString(_ payload: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload,
+                                                     options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return json
     }
 
     /// Exponential from 250ms: 0.25, 0.5, 1, 2, 4, 8, 16, 32, 60…
@@ -540,6 +754,38 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
             return false        // an attempt is genuinely in flight
         }
         return true
+    }
+
+    /// Whether this entity's payload is identical to the one already retained.
+    ///
+    /// Pure, because `post()` needs a live socket and so cannot be reached by a test at
+    /// all — the rule that decides whether an entity goes quiet must be assertable
+    /// somewhere. The failure mode being guarded is the reason: always-publish fails
+    /// loudly, with bad data someone notices, while suppression fails silently, with an
+    /// entity that stops updating and is discovered when it is needed.
+    ///
+    /// No previous payload always publishes, so the first run after a launch or a
+    /// reconnect sends everything.
+    nonisolated static func shouldSkipPublish(enabled: Bool,
+                                              previous: String?,
+                                              current: String) -> Bool {
+        guard enabled, let previous else { return false }
+        return previous == current
+    }
+
+    /// The stored client id, or a fresh one when nothing is stored yet.
+    ///
+    /// Pure so it can be asserted on directly: the test target is hosted by the app
+    /// bundle and shares the user's real UserDefaults, so a test must never build a
+    /// `SettingsStore` to check that the id is stable. The caller writes the result
+    /// back when it differs from what it passed in.
+    ///
+    /// **What a stable id does and does not buy.** CocoaMQTT defaults `cleanSession`
+    /// to true and we never override it, so no session is resumed either way, and the
+    /// last will is registered per connection, so availability works regardless. What
+    /// it buys is one identity on the broker instead of one per launch.
+    nonisolated static func resolveClientId(stored: String) -> String {
+        stored.isEmpty ? "FindMySyncPlus-\(UUID().uuidString.prefix(8))" : stored
     }
 
     nonisolated static func backoffDelay(forAttempt attempt: Int) -> TimeInterval {
@@ -590,6 +836,9 @@ extension MQTTClient: CocoaMQTTDelegate {
                 self.reconnectTask?.cancel()
                 self.publishedDiscoveryIds.removeAll()
                 self.publishedBatterySensorIds.removeAll()
+                self.publishedStatusDiscovery = false
+                self.lastPublishedAttributes.removeAll()
+                self.publishAvailability(Self.availabilityOnline)
                 self.logger?.info("MQTT connected (discovery will re-publish)")
             } else {
                 self.logger?.error("MQTT connection rejected: \(ackDesc)")
