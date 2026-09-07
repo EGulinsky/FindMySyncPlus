@@ -61,11 +61,6 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// When the in-flight attempt started, so a stalled one is replaced rather than
     /// leaving the client wedged in `.connecting`.
     private var connectingSince: Date?
-
-    /// How long the client is kept alive after saying `offline`, so its queued writes
-    /// reach the socket before it is released.
-    nonisolated static let goodbyeGraceMilliseconds = 500
-
     nonisolated static let connectingTimeout: TimeInterval = 15
 
     /// Sized so the whole retry chain (0.25 + 0.5 + 1 + 2 + 4 + 8 + 16 ≈ 32s) finishes
@@ -91,9 +86,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     ///   pre-flight, the connection test), which starts a fresh retry schedule. `false`
     ///   for a scheduled reconnect, which must keep advancing the existing one.
     func connect(settings: SettingsStore, resetBackoff: Bool = true) {
-        // `announce: false` — tearing down to reconnect is not going away, and saying
-        // offline here would flap the Connected sensor on every retry.
-        disconnect(resetBackoff: resetBackoff, announce: false)
+        disconnect(resetBackoff: resetBackoff)
         intentionalDisconnect = false
         guard !settings.mqttHost.isEmpty else {
             logger?.warn("MQTT: host not configured")
@@ -151,8 +144,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // Every intentional close lands here: the scheduler stopping, the idle release
         // after a user action, a connection test tearing itself down, and quitting. An
         // unexpected drop leaves no client to publish through and is covered by the will.
-        let announcing = announce && connectionState == .connected
-        if announcing {
+        if announce, connectionState == .connected {
             publishAvailability(Self.availabilityOffline)
         }
         intentionalDisconnect = true
@@ -162,24 +154,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // tears the client down too, and resetting here would pin every attempt at the
         // first delay — an endless fast loop that never backs off or gives up.
         if resetBackoff { reconnectAttempts = 0 }
-        if announcing, let dying = client {
-            // Hold the client alive until its writes land. Both the `offline` publish and
-            // the DISCONNECT frame are handed to CocoaMQTT and written asynchronously, so
-            // dropping the last reference in this same turn can deallocate it before
-            // either reaches the socket. Measured: the app logged `offline` at 5:30:37 and
-            // Home Assistant did not react until 5:32:56 — a keepalive timeout firing the
-            // will, which is what happens when the broker receives neither frame.
-            //
-            // Safe on this path only: the scheduler stopping or an idle release, where the
-            // process stays alive and no reconnect follows. Quitting can wait for nothing
-            // and relies on the will by design.
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(Self.goodbyeGraceMilliseconds))
-                dying.disconnect()
-            }
-        } else {
-            client?.disconnect()
-        }
+        client?.disconnect()
         client = nil
         activeClientToken = nil
         connectionState = .disconnected
