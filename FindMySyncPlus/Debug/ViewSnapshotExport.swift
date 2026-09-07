@@ -46,7 +46,7 @@ enum ViewSnapshotExport {
 
     /// Names this run in the manifest — the fixture shape, set by the driver.
     private static var label: String {
-        UserDefaults.standard.string(forKey: "demoRenderLabel") ?? "unlabelled"
+        UserDefaults.standard.string(forKey: "demoRenderLabel") ?? "unlabeled"
     }
 
     /// Renders are compared pixel by pixel, so everything except the code under test is
