@@ -20,7 +20,7 @@ struct HomeView: View {
     private var statusColor: Color { app.statusColor }
 
     var body: some View {
-        ScrollView {
+        AppScroll {
             VStack(alignment: .leading, spacing: 20) {
                 // --- Status Card ---
                 Card {

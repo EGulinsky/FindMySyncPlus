@@ -2,6 +2,21 @@ import SwiftUI
 import AppKit
 
 struct DeviceManagerView: View {
+    /// Show every group expanded, regardless of what the user has toggled.
+    ///
+    /// An ordinary initializer default rather than the view reading a global. Disclosure
+    /// lives in `@State` below and starts closed, so a caller that renders this view offscreen
+    /// has no way to open it — and grouped nesting, which is what issues #22 and #24 were
+    /// about, appeared in no render at all until this existed.
+    ///
+    /// A `Bool` and not the expanded sets themselves: the caller wants "all of them" and does
+    /// not know the ids.
+    let expandAllGroups: Bool
+
+    init(expandAllGroups: Bool = false) {
+        self.expandAllGroups = expandAllGroups
+    }
+
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var app: AppModel
     @EnvironmentObject private var logger: LogStore
@@ -333,14 +348,14 @@ struct DeviceManagerView: View {
 
     var body: some View {
         ZStack {
-            SnapshotSafeVSplit {
+            AppVSplit {
                 // --- Unassigned ---
                 VStack(spacing: 0) {
                     sectionHeader(
                         title: "Unassigned",
                         tip: "Link a device’s UUID to an alias. The alias becomes a stable Home Assistant entity that persists even when Apple rotates UUIDs.",
                         trailing: {
-                            SnapshotSafeMenuPicker(selectionTitle: unassignedFilter.title) {
+                            AppMenuPicker(selectionTitle: unassignedFilter.title) {
                                 Picker("", selection: $unassignedFilter) {
                                     ForEach(SourceFilter.allCases) { f in
                                         Text(f.title).tag(f)
@@ -368,7 +383,7 @@ struct DeviceManagerView: View {
                         title: "Aliases",
                         tip: "Manage your tracked aliases. Apple rotates UUIDs periodically — add new ones here and the HA entity stays the same. Renaming an alias changes its HA entity ID.",
                         trailing: {
-                            SnapshotSafeMenuPicker(selectionTitle: aliasesFilter.title) {
+                            AppMenuPicker(selectionTitle: aliasesFilter.title) {
                                 Picker("", selection: $aliasesFilter) {
                                     ForEach(SourceFilter.allCases) { f in
                                         Text(f.title).tag(f)
@@ -565,14 +580,13 @@ struct DeviceManagerView: View {
                     return topLevelIDs.contains(pid.normalized())
                 }, by: { $0.point.parentID!.normalized() })
 
-            SnapshotSafeScroll {
+            AppScroll {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(topLevel.enumerated()), id: \.1.point.id) { idx, entry in
                         let isLast = idx == topLevel.count - 1
                         let parentNormalizedID = entry.point.id.normalized()
                         let kids = childrenByParent[parentNormalizedID] ?? []
-                        let isExpanded = ViewSnapshotExport.expandGroups
-                            || expandedParents.contains(parentNormalizedID)
+                        let isExpanded = expandAllGroups || expandedParents.contains(parentNormalizedID)
                         let disclosure: (isCollapsed: Bool, onToggle: () -> Void)? = kids.isEmpty
                             ? nil
                             : (!isExpanded, {
@@ -671,7 +685,7 @@ struct DeviceManagerView: View {
                     emptyState(img, msg)
                 }
             } else {
-                SnapshotSafeScroll {
+                AppScroll {
                     LazyVStack(spacing: 0) {
                         // Grouped accessories nest here as they already do in
                         // Unassigned. The join is the persisted `parentAlias`, not the
@@ -749,10 +763,7 @@ struct DeviceManagerView: View {
                             // Collapsed until opened, matching the Unassigned list
                             // exactly — same control, same default, so the same
                             // accessory behaves the same way in both places.
-                            // A snapshot renders both states; see ViewSnapshotExport.expandGroups.
-                            let isCollapsed = ViewSnapshotExport.expandGroups
-                                ? false
-                                : !expandedAliasParents.contains(rec.alias)
+                            let isCollapsed = expandAllGroups ? false : !expandedAliasParents.contains(rec.alias)
                             ParentDisclosureRow(
                                 hasChildren: !kids.isEmpty,
                                 isCollapsed: isCollapsed,

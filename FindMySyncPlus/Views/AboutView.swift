@@ -72,7 +72,7 @@ struct AboutView: View {
     }
 
     var body: some View {
-        ScrollView {
+        AppScroll {
             VStack(spacing: 24) {
                 VStack(spacing: 12) {
                     appIcon

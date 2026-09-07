@@ -28,7 +28,7 @@ struct GeneralSettingsView: View {
     }()
 
     var body: some View {
-        ScrollView {
+        AppScroll {
             VStack(spacing: 16) {
                 schedulerCard
                 findMyCard

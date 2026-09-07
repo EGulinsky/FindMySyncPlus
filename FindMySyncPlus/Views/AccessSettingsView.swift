@@ -35,7 +35,7 @@ struct AccessSettingsView: View {
     @State private var showTransportSwitchAlert: Bool = false
 
     var body: some View {
-        ScrollView {
+        AppScroll {
             VStack(spacing: 16) {
                 SectionHeader(
                     title: "ENDPOINT",

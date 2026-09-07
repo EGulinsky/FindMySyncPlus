@@ -18,6 +18,7 @@ import AppKit
 enum ViewSnapshotExport {
 
     /// Where to write. Absent means do nothing.
+    /// Read by `substituting` as well, to keep the fallback branch unreachable without opt-in.
     static var outputDirectory: URL? {
         guard let path = UserDefaults.standard.string(forKey: "demoRenderExport"),
               !path.isEmpty else { return nil }
@@ -54,16 +55,6 @@ enum ViewSnapshotExport {
     /// read it to substitute a plain stack for a container `ImageRenderer` cannot draw.
     @MainActor private(set) static var isRendering = false
 
-    /// Whether this render should show grouped children nested under their parent.
-    ///
-    /// Disclosure lives in `DeviceManagerView`'s `@State` and starts closed, so every screen
-    /// render was fully collapsed — and grouped nesting, which is what issues #22 and #24
-    /// were about, appeared in no baseline at all. The pieces were in the alias list and
-    /// hidden behind a chevron nothing could open.
-    ///
-    /// Both states are rendered: collapsed is what a user opens the window to, expanded is
-    /// where the feature is visible.
-    @MainActor private(set) static var expandGroups = false
 
     /// Called when a run finishes. Renders once, then terminates so the demo session's
     /// restore trap fires.
@@ -158,17 +149,16 @@ enum ViewSnapshotExport {
 
         var entries: [[String: Any]] = []
         isRendering = true
-        defer { isRendering = false; expandGroups = false }
+        defer { isRendering = false }
         // Both disclosure states. Collapsed is what a user opens the window to; expanded is
         // where grouped children are visible at all, and that is the feature these fixtures
         // exist to exercise.
         let variants: [(name: String, expand: Bool)] = [("collapsed", false), ("expanded", true)]
 
         for variant in variants {
-            expandGroups = variant.expand
             notedPartition = false
             for (appearance, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
-                let screen = DeviceManagerView()
+                let screen = DeviceManagerView(expandAllGroups: variant.expand)
                     .environmentObject(settings)
                     .environmentObject(app)
                     .environmentObject(logger)
