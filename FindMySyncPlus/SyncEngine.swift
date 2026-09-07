@@ -169,7 +169,8 @@ final class SyncEngine {
             guard await runPreflight(using: candidates, settings: settings, logger: logger, dryRun: dryRun) else { return }
         }
 
-        await refreshFindMyIfNeeded(kind: kind, settings: settings, logger: logger, dryRun: dryRun)
+        let findMyLaunched = await refreshFindMyIfNeeded(kind: kind, settings: settings,
+                                                        logger: logger, dryRun: dryRun)
 
         let io = await readCaches(candidates: candidates, hasFMIPSources: hasFMIPSources,
                                   hasFriendSource: hasFriendSource, settings: settings, logger: logger)
@@ -198,12 +199,13 @@ final class SyncEngine {
         let postSummary = await postAndReport(plan.toPost, aliasByUUID: plan.aliasByUUID,
                                               settings: settings, logger: logger, dryRun: dryRun)
 
-        logRunComplete(t0: t0, plan: plan, postSummary: postSummary, dryRun: dryRun,
-                       app: app, logger: logger)
+        let status = StatusRun(startedAt: t0, metrics: plan.metrics,
+                               postSummary: postSummary, dryRun: dryRun,
+                               findMyLaunched: findMyLaunched,
+                               cacheWritten: FMIPCacheFile.newestWrite(among: candidates))
 
-        publishStatusEntity(StatusRun(startedAt: t0, metrics: plan.metrics,
-                                      postSummary: postSummary, dryRun: dryRun),
-                            settings: settings, logger: logger, app: app)
+        logRunComplete(status, app: app, logger: logger)
+        publishStatusEntity(status, settings: settings, logger: logger, app: app)
     }
 
     // MARK: - Run pipeline helpers
@@ -243,19 +245,24 @@ final class SyncEngine {
         return list
     }
 
+    /// - Returns: whether Find My was actually relaunched, which the status entity and
+    ///   the run line both report. The cache advances because we launch Find My, so
+    ///   "the cache did not move" is only a finding once you know we asked it to.
+    @discardableResult
     private func refreshFindMyIfNeeded(kind: RunKind, settings: SettingsStore,
-                                       logger: LogStore, dryRun: Bool) async {
+                                       logger: LogStore, dryRun: Bool) async -> Bool {
         // A triggered run refreshes whatever the toggle says. That is the entire point of
         // the trigger: the refresh is otherwise all-runs-or-no-runs, and the person asking
         // for it wants it off for the scheduled ones.
-        guard settings.autoLaunchKillFindMy || kind == .triggered else { return }
+        guard settings.autoLaunchKillFindMy || kind == .triggered else { return false }
         if dryRun {
             logger.info("[DRY] Would refresh Find My (launch/kill)")
-        } else {
-            await FindMyRefresher.refreshBlocking(
-                logger: logger, enabled: true, waitSeconds: settings.findMyWaitSeconds
-            )
+            return false
         }
+        await FindMyRefresher.refreshBlocking(
+            logger: logger, enabled: true, waitSeconds: settings.findMyWaitSeconds
+        )
+        return true
     }
 
     private func readCaches(candidates: [FMIPCacheFile], hasFMIPSources: Bool,
@@ -361,36 +368,50 @@ final class SyncEngine {
         return postSummary
     }
 
-    private func logRunComplete(t0: Date, plan: PlanPhase, postSummary: PostSummary,
-                                dryRun: Bool, app: AppModel, logger: LogStore) {
-        let m = plan.metrics
-        let elapsed = String(format: "%.2f", Date().timeIntervalSince(t0))
+    /// Takes the same `StatusRun` the status entity is built from, so the line a reporter
+    /// pastes and the attributes Home Assistant shows can never disagree — and so the run's
+    /// inputs sit beside its outcome on one row rather than in two places.
+    private func logRunComplete(_ run: StatusRun, app: AppModel, logger: LogStore) {
+        let m = run.metrics
+        let elapsed = String(format: "%.2f", Date().timeIntervalSince(run.startedAt))
 
-        if dryRun {
-            var parts = [
-                "discovered=\(m.discoveredDevices + m.discoveredItems + m.discoveredFriends)",
+        var parts = [
+            "discovered=\(m.discoveredDevices + m.discoveredItems + m.discoveredFriends)"
+        ]
+        if run.dryRun {
+            parts += [
                 "located=\(m.locatedDevices + m.locatedItems + m.locatedFriends)",
                 "would_post=\(m.toPostCount)",
                 "unassigned=\(m.unassignedCount)"
             ]
-            if m.noLocationCount > 0 { parts.append("no_location=\(m.noLocationCount)") }
-            if m.locatedFriends > 0 { parts.append("friends=\(m.locatedFriends)") }
-            logger.info("[DRY] Finished run — \(parts.joined(separator: " ")) elapsed=\(elapsed)s")
         } else {
-            var parts = [
-                "discovered=\(m.discoveredDevices + m.discoveredItems + m.discoveredFriends)",
+            parts += [
                 "unassigned=\(m.unassignedCount)",
                 "located=\(m.locatedDevices + m.locatedItems + m.locatedFriends)",
                 "tracked=\(m.toPostCount)",
-                "posted=\(postSummary.successCount)"
+                "posted=\(run.postSummary.successCount)"
             ]
-            if m.noLocationCount > 0 { parts.append("no_location=\(m.noLocationCount)") }
-            if m.locatedFriends > 0 { parts.append("friends=\(m.locatedFriends)") }
-            logger.info("Finished run — \(parts.joined(separator: " ")) elapsed=\(elapsed)s")
-
-            if !app.lastRunHadWarnings { app.totalRunsCount += 1 }
-            app.postedUpdatesCount += postSummary.successCount
+            if run.postSummary.skippedUnchangedCount > 0 {
+                parts.append("skipped_unchanged=\(run.postSummary.skippedUnchangedCount)")
+            }
         }
+        if m.noLocationCount > 0 { parts.append("no_location=\(m.noLocationCount)") }
+        if m.locatedFriends > 0 { parts.append("friends=\(m.locatedFriends)") }
+
+        // The two freshness inputs, raw and beside the outcome they explain. Without
+        // `find_my`, "the cache did not move" reads as a fault when it may be a setting.
+        parts.append("find_my=\(run.findMyLaunched ? "launched" : "not_launched")")
+        if let written = run.cacheWritten {
+            let age = Date().timeIntervalSince(written) / 3600
+            parts.append("cache_age=\(Self.ageDescription(age))")
+        }
+
+        let prefix = run.dryRun ? "[DRY] " : ""
+        logger.info("\(prefix)Finished run — \(parts.joined(separator: " ")) elapsed=\(elapsed)s")
+
+        guard !run.dryRun else { return }
+        if !app.lastRunHadWarnings { app.totalRunsCount += 1 }
+        app.postedUpdatesCount += run.postSummary.successCount
     }
 
     // MARK: - Read and parse caches

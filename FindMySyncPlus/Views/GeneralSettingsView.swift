@@ -150,8 +150,8 @@ struct GeneralSettingsView: View {
                         .font(.title3).fontWeight(.semibold)
 
                     InfoTip(message: """
-                        Skip repeated locations updates an entity only when Find My has \
-                        an updated location, as opposed to publishing on every sync.
+                        Skip repeated locations publishes an entity update only when \
+                        Find My has a fresh location, rather than on every sync.
 
                         Subscribing listens on an MQTT topic to trigger an ad-hoc Find My \
                         launch and run a single sync. Useful when combined with disabling \

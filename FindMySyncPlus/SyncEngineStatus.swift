@@ -18,6 +18,12 @@ extension SyncEngine {
         let metrics: RunMetrics
         let postSummary: PostSummary
         let dryRun: Bool
+        /// Whether this run relaunched Find My, and when the cache it read was last
+        /// written. Carried together because neither means much alone: the cache advances
+        /// because we launch Find My, so "it did not move" is only a finding once you know
+        /// we asked.
+        let findMyLaunched: Bool
+        let cacheWritten: Date?
     }
 
     /// Publish the sync status entity for this run.
@@ -40,7 +46,6 @@ extension SyncEngine {
         let report = SyncStatusReport(
             version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
                 as? String ?? "—",
-            transport: settings.transportMode.rawValue,
             runSeconds: Date().timeIntervalSince(run.startedAt),
             discovered: m.discoveredDevices + m.discoveredItems + m.discoveredFriends,
             located: m.locatedDevices + m.locatedItems + m.locatedFriends,
@@ -50,6 +55,8 @@ extension SyncEngine {
             noLocation: m.noLocationCount,
             unassigned: m.unassignedCount,
             sleptDuringRun: app.sleptDuring(runStartedAt: run.startedAt),
+            findMyLaunched: run.findMyLaunched,
+            cacheWritten: run.cacheWritten,
             keys: SyncStatusReport.keysDescription(fmip: settings.fmipKeyStatus,
                                                    fmf: settings.fmfKeyStatus,
                                                    localStorage: settings.localStorageKeyStatus),

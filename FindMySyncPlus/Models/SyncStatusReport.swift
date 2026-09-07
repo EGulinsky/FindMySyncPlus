@@ -16,7 +16,6 @@ import Foundation
 /// nobody could act on.
 struct SyncStatusReport {
     let version: String
-    let transport: String
     let runSeconds: Double
     let discovered: Int
     let located: Int
@@ -26,6 +25,20 @@ struct SyncStatusReport {
     let noLocation: Int
     let unassigned: Int
     let sleptDuringRun: Bool
+    /// Whether this run actually relaunched Find My.
+    ///
+    /// Half of the freshness question. The cache advances because we launch Find My, so
+    /// "did the cache move" only means something beside "did we ask it to".
+    let findMyLaunched: Bool
+    /// When Apple last wrote the newest cache we read.
+    ///
+    /// Published raw rather than turned into a freshness verdict: mtime answers "a write
+    /// happened", never "a position arrived" — a write four seconds after the previous one
+    /// carrying an identical digest has been measured. Beside `find_my_launched` and
+    /// `skipped_unchanged` it separates the three cases a support thread would otherwise
+    /// be opened to distinguish: we asked and it wrote and nothing was new, we asked and
+    /// it never wrote, or we never asked.
+    let cacheWritten: Date?
     let keys: String
     let fullDiskAccess: Bool
     let lastError: String?
@@ -42,11 +55,11 @@ struct SyncStatusReport {
     var attributes: [String: Any] {
         [
             "version": version,
-            "transport": transport,
-            // Rounded to hundredths: the raw Double carries microsecond noise that
-            // would change every run and make the payload look eventful when nothing
-            // happened.
-            "run_seconds": (runSeconds * 100).rounded() / 100,
+            // Raw, like `gps_accuracy`. Rounding to hundredths was tried and bought
+            // nothing: Foundation serializes any Double that is not exactly representable
+            // at full precision, so `5.11` went on the wire as `5.1100000000000003`
+            // anyway — the same shape `gps_accuracy` has shipped with all along.
+            "run_seconds": runSeconds,
             "discovered": discovered,
             "located": located,
             "tracked": tracked,
@@ -59,6 +72,10 @@ struct SyncStatusReport {
             // `run_seconds: 961` on its own is a support thread, and with this beside
             // it the question answers itself.
             "slept_during_run": sleptDuringRun,
+            "find_my_launched": findMyLaunched,
+            // Built here rather than held as a static: `ISO8601DateFormatter` is not
+            // `Sendable`, and this runs once per sync.
+            "cache_written": cacheWritten.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "keys": keys,
             "full_disk_access": fullDiskAccess,
             // `NSNull` rather than an omitted key: an attribute that disappears when

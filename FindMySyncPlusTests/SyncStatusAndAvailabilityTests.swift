@@ -113,11 +113,14 @@ struct SyncStatusAndAvailabilityTests {
 
     private static func report(skippedUnchanged: Int = 9,
                                sleptDuringRun: Bool = false,
+                               findMyLaunched: Bool = true,
+                               cacheWritten: Date? = Date(timeIntervalSince1970: 1_756_000_000),
                                lastError: String? = nil) -> SyncStatusReport {
-        SyncStatusReport(version: "1.5b", transport: "mqtt", runSeconds: 5.0341,
+        SyncStatusReport(version: "1.5b", runSeconds: 5.0341,
                          discovered: 13, located: 12, tracked: 11, published: 2,
                          skippedUnchanged: skippedUnchanged, noLocation: 2, unassigned: 1,
                          sleptDuringRun: sleptDuringRun,
+                         findMyLaunched: findMyLaunched, cacheWritten: cacheWritten,
                          keys: "fmip ok, fmf missing, localstorage missing",
                          fullDiskAccess: true, lastError: lastError)
     }
@@ -130,9 +133,10 @@ struct SyncStatusAndAvailabilityTests {
         let keys = Set(Self.report().attributes.keys)
 
         #expect(keys == [
-            "version", "transport", "run_seconds", "discovered", "located", "tracked",
+            "version", "run_seconds", "discovered", "located", "tracked",
             "published", "skipped_unchanged", "no_location", "unassigned",
-            "slept_during_run", "keys", "full_disk_access", "last_error"
+            "slept_during_run", "find_my_launched", "cache_written",
+            "keys", "full_disk_access", "last_error"
         ])
     }
 
@@ -148,11 +152,46 @@ struct SyncStatusAndAvailabilityTests {
         #expect(attrs["skipped"] == nil, "the ambiguous name must not appear")
     }
 
-    /// Microsecond noise on the run duration would change the payload every run and
-    /// make an uneventful sync look eventful.
-    @Test("run_seconds is rounded to hundredths")
-    func runSecondsIsRounded() {
-        #expect(Self.report().attributes["run_seconds"] as? Double == 5.03)
+    /// `transport` could only ever read "mqtt": the publisher guards on the transport
+    /// mode and writes onto the MQTT device block. A constant dressed as data, in a
+    /// payload people write templates against.
+    @Test("no transport attribute, because it could only say one thing")
+    func noConstantTransportAttribute() {
+        #expect(Self.report().attributes["transport"] == nil)
+    }
+
+    /// Neither half means much alone. The cache advances because we launch Find My, so
+    /// "the cache did not move" separates a Find My fault from your own setting only once
+    /// `find_my_launched` says whether we asked.
+    @Test("the freshness inputs are published raw, not as a verdict")
+    func freshnessInputsArePublishedRaw() {
+        let written = Date(timeIntervalSince1970: 1_756_000_000)
+        let attrs = Self.report(findMyLaunched: true, cacheWritten: written).attributes
+
+        #expect(attrs["find_my_launched"] as? Bool == true)
+        #expect(attrs["cache_written"] as? String == ISO8601DateFormatter().string(from: written))
+        // No computed staleness: the threshold is the user's to pick.
+        #expect(attrs["cache_age"] == nil)
+        #expect(attrs["cache_is_stale"] == nil)
+    }
+
+    /// A missing cache is normal — `ItemGroups.data` is absent on some machines — and the
+    /// key stays present as null so a template reading it needs no guard.
+    @Test("an unreadable cache reports null rather than dropping the key")
+    func absentCacheReportsNull() {
+        #expect(Self.report(cacheWritten: nil).attributes["cache_written"] is NSNull)
+    }
+
+    @Test("a run that never launched Find My says so")
+    func notLaunchedIsReported() {
+        #expect(Self.report(findMyLaunched: false).attributes["find_my_launched"] as? Bool == false)
+    }
+
+    /// Passed through like `gps_accuracy`. Rounding was tried and bought nothing —
+    /// Foundation serializes an inexact Double at full precision either way.
+    @Test("run_seconds is the raw duration")
+    func runSecondsIsRaw() {
+        #expect(Self.report().attributes["run_seconds"] as? Double == 5.0341)
     }
 
     /// A run of 961 seconds looks broken on its own and is not. The scheduler no longer

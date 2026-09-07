@@ -63,6 +63,27 @@ enum FMIPCacheFile {
     case itemGroups
     case friendCache
 
+    /// When Apple last wrote this cache, or `nil` if it is absent or unreadable.
+    ///
+    /// A `stat`, not a read: it costs nothing and needs no key, so it works even on a run
+    /// where decryption failed. Absent is normal — `ItemGroups.data` does not exist on
+    /// every machine.
+    var lastWritten: Date? {
+        let url = ReadRoot.url.appendingPathComponent(relativePath)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return nil
+        }
+        return attrs[.modificationDate] as? Date
+    }
+
+    /// The newest write across a set of caches.
+    ///
+    /// The newest rather than a per-file map: the question this answers is "did Find My
+    /// write anything for us this cycle", and one timestamp answers it.
+    static func newestWrite(among files: [FMIPCacheFile]) -> Date? {
+        files.compactMap(\.lastWritten).max()
+    }
+
     var relativePath: String {
         switch self {
         case .devices:
