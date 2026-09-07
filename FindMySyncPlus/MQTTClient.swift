@@ -11,7 +11,7 @@ enum MQTTConnectionState: Sendable {
 final class MQTTClient: NSObject, ObservableObject, TransportClient {
     @Published private(set) var connectionState: MQTTConnectionState = .disconnected
 
-    private var client: CocoaMQTT?
+    var client: CocoaMQTT?
     private var reconnectTask: Task<Void, Never>?
     private(set) var reconnectAttempts = 0
     private var publishedDiscoveryIds: Set<String> = []
@@ -19,8 +19,8 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// `publishBatterySensorIfNeeded`.
     private var publishedBatterySensorIds: Set<String> = []
 
-    private weak var logger: LogStore?
-    private weak var settings: SettingsStore?
+    weak var logger: LogStore?
+    weak var settings: SettingsStore?
     private var intentionalDisconnect = false
 
     /// Identity of the client this object currently owns. CocoaMQTT's delegate
@@ -44,7 +44,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// Set once this session has settled the refresh button — published when the trigger
     /// is on, cleared when it is off. Both directions run once, so flipping the setting
     /// cannot leave a button behind that presses into nothing.
-    private var settledRefreshButton = false
+    var settledRefreshButton = false
 
     /// Called when a refresh is asked for over MQTT. Set by `AppModel`, which owns the
     /// decision about whether a run may start; this object only decides that a genuine,
@@ -56,11 +56,16 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// Cleared on reconnect beside `publishedDiscoveryIds`: retained discovery is
     /// republished then, and a suppression map that survived would leave an entity
     /// with a fresh config and no state behind it.
-    private var lastPublishedAttributes: [String: String] = [:]
+    private var lastPublishedAttributes: [String: PublishedState] = [:]
 
     /// When the in-flight attempt started, so a stalled one is replaced rather than
     /// leaving the client wedged in `.connecting`.
     private var connectingSince: Date?
+
+    /// How long the client is kept alive after saying `offline`, so its queued writes
+    /// reach the socket before it is released.
+    nonisolated static let goodbyeGraceMilliseconds = 500
+
     nonisolated static let connectingTimeout: TimeInterval = 15
 
     /// Sized so the whole retry chain (0.25 + 0.5 + 1 + 2 + 4 + 8 + 16 ≈ 32s) finishes
@@ -86,7 +91,9 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     ///   pre-flight, the connection test), which starts a fresh retry schedule. `false`
     ///   for a scheduled reconnect, which must keep advancing the existing one.
     func connect(settings: SettingsStore, resetBackoff: Bool = true) {
-        disconnect(resetBackoff: resetBackoff)
+        // `announce: false` — tearing down to reconnect is not going away, and saying
+        // offline here would flap the Connected sensor on every retry.
+        disconnect(resetBackoff: resetBackoff, announce: false)
         intentionalDisconnect = false
         guard !settings.mqttHost.isEmpty else {
             logger?.warn("MQTT: host not configured")
@@ -136,15 +143,12 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// - Parameter announce: whether to say `offline` before closing. Quitting passes
     ///   `false` and relies on the will instead, having nothing it can wait for.
     func disconnect(resetBackoff: Bool = true, announce: Bool = true) {
-        // Say we are going before we go. A clean DISCONNECT makes the broker discard the
-        // will, so without this the retained `online` outlives the connection and Home
-        // Assistant reads Connected while the app's own status light reads disconnected —
-        // the two disagreeing about the same fact.
-        //
-        // Every intentional close lands here: the scheduler stopping, the idle release
-        // after a user action, a connection test tearing itself down, and quitting. An
-        // unexpected drop leaves no client to publish through and is covered by the will.
-        if announce, connectionState == .connected {
+        // A clean DISCONNECT makes the broker discard the will, so an intentional close has
+        // to say `offline` itself or Home Assistant reads Connected while the app's own
+        // status light reads disconnected. An unexpected drop has no client to publish
+        // through and is covered by the will.
+        let announcing = announce && connectionState == .connected
+        if announcing {
             publishAvailability(Self.availabilityOffline)
         }
         intentionalDisconnect = true
@@ -154,7 +158,21 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // tears the client down too, and resetting here would pin every attempt at the
         // first delay — an endless fast loop that never backs off or gives up.
         if resetBackoff { reconnectAttempts = 0 }
-        client?.disconnect()
+        if announcing, let dying = client {
+            // Hold the client alive until its writes land: both frames are written
+            // asynchronously, so dropping the last reference in the same turn can
+            // deallocate it before either reaches the socket. Measured — the app logged
+            // `offline` at 5:30:37 and Home Assistant reacted at 5:32:56, a keepalive
+            // timeout firing the will, which is what happens when the broker receives
+            // neither. Safe only here, where the process stays alive and nothing
+            // reconnects; quitting can wait for nothing and uses the will.
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(Self.goodbyeGraceMilliseconds))
+                dying.disconnect()
+            }
+        } else {
+            client?.disconnect()
+        }
         client = nil
         activeClientToken = nil
         connectionState = .disconnected
@@ -173,9 +191,8 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// state rather than wait for the next transition.
     private func publishAvailability(_ state: String) {
         guard let target = availabilityPublisher, let topic = availabilityTopicInUse else {
-            // Silence here left a user with no way to tell "the app never said it" from
-            // "the broker never delivered it" — the only two explanations for Home
-            // Assistant still reading Connected, and they need opposite fixes.
+            // Silence left a user unable to tell "the app never said it" from "the broker
+            // never delivered it" — two explanations needing opposite fixes.
             logger?.warn("MQTT: could not publish \(state) — no live connection to announce on")
             return
         }
@@ -185,10 +202,9 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
     /// Where availability goes. Normally the socket; in tests, a recorder.
     ///
-    /// The seam exists because `connect()` and `disconnect()` hold a concrete `CocoaMQTT`,
-    /// which no test can build — so the connection *lifecycle* had no coverage at all,
-    /// and "does stopping tell Home Assistant" was a question nothing could ask. Shipping
-    /// a retained `online` that outlived the connection is what that gap cost.
+    /// `connect()` and `disconnect()` hold a concrete `CocoaMQTT` that no test can build, so
+    /// the connection lifecycle had no coverage — and shipping a retained `online` that
+    /// outlived the connection is what that gap cost.
     private var availabilityPublisher: MQTTPublishing? {
         #if DEBUG
         if let testPublisher { return testPublisher }
@@ -278,11 +294,13 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
         var successCount = 0
         var transientCount = 0
-        var skippedUnchangedCount = 0
+        var identicalCount = 0
+        var withinThresholdCount = 0
         let prefix = settings.mqttTopicPrefix
         let iso = ISO8601DateFormatter()
         let cycle = AttributeCycle(prefix: prefix, iso: iso,
-                                   skipRepeats: settings.skipRepeatedLocations)
+                                   skipRepeats: settings.skipRepeatedLocations,
+                                   minimumMovementMetres: settings.minimumMovementMetres)
 
         drainRetiredDevIds(client: client, aliasByUUID: aliasByUUID,
                            settings: settings, logger: logger, prefix: prefix)
@@ -322,24 +340,34 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
             switch publishAttributes(client: client, device: d, devId: devId,
                                      cycle: cycle, logger: logger) {
-            case .published:      successCount += 1
-            case .skippedUnchanged: skippedUnchangedCount += 1
-            case .failed:         transientCount += 1
+            case .published:             successCount += 1
+            case .skippedIdentical:      identicalCount += 1
+            case .skippedWithinThreshold: withinThresholdCount += 1
+            case .failed:                transientCount += 1
             }
         }
 
         // Never silent: with skipping on, "working as intended" and "broken" look
         // identical from the outside, and this line plus `skipped_unchanged` on the
         // status entity are the two things that tell them apart.
-        if skippedUnchangedCount > 0 {
-            logger.info("MQTT: \(skippedUnchangedCount) entit\(skippedUnchangedCount == 1 ? "y" : "ies") "
-                        + "unchanged since the last publish, not republished")
+        // Names both reasons. With skipping on, "working as intended" and "broken" look
+        // identical from the outside, and the split is what tells them apart: nothing
+        // changed, against a move the threshold decided was near enough.
+        let skipped = identicalCount + withinThresholdCount
+        if skipped > 0 {
+            var reasons = ["\(identicalCount) identical"]
+            if withinThresholdCount > 0 {
+                reasons.append(String(format: "%d within %.1f m",
+                                      withinThresholdCount, settings.minimumMovementMetres))
+            }
+            logger.info("MQTT: \(skipped) entit\(skipped == 1 ? "y" : "ies") not republished "
+                        + "(\(reasons.joined(separator: ", ")))")
         }
 
         return PostSummary(successCount: successCount,
                            authRejectedCount: 0,
                            transientCount: transientCount,
-                           skippedUnchangedCount: skippedUnchangedCount)
+                           skippedUnchangedCount: skipped)
     }
 
     /// Build and publish one device's attributes, skipping a payload identical to the
@@ -356,116 +384,35 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
                                    cycle: AttributeCycle,
                                    logger: LogStore) -> AttributePublishOutcome {
         let (prefix, iso, skipRepeats) = (cycle.prefix, cycle.iso, cycle.skipRepeats)
-        guard let json = Self.jsonString(buildAttributes(for: device, iso: iso)) else {
+        let attrs = buildAttributes(for: device, iso: iso)
+        guard let json = Self.jsonString(attrs), let signature = Self.signature(of: attrs) else {
             logger.warn("[\(devId)] MQTT: attributes could not be serialized; not published")
             return .failed
         }
 
-        if Self.shouldSkipPublish(enabled: skipRepeats,
-                                  previous: lastPublishedAttributes[devId],
-                                  current: json) {
+        let state = PublishedState(signature: signature,
+                                   latitude: device.latitude,
+                                   longitude: device.longitude)
+        switch Self.suppressionDecision(enabled: skipRepeats,
+                                        previous: lastPublishedAttributes[devId],
+                                        current: state,
+                                        thresholdMetres: cycle.minimumMovementMetres) {
+        case .identical:
             logger.debug("[\(devId)] unchanged since the last publish — skipped")
-            return .skippedUnchanged
+            return .skippedIdentical
+        case .withinThreshold(let moved):
+            logger.debug(String(format: "[%@] moved %.2f m, within %.1f m — skipped",
+                                devId, moved, cycle.minimumMovementMetres))
+            return .skippedWithinThreshold
+        case .publish:
+            break
         }
 
         client.send(CocoaMQTTMessage(topic: Self.attributesTopic(forDevId: devId, prefix: prefix),
                                      string: json, qos: .qos1, retained: true))
-        lastPublishedAttributes[devId] = json
+        lastPublishedAttributes[devId] = state
         logger.info("[\(devId)] MQTT published")
         return .published
-    }
-
-    // MARK: - Refresh trigger
-
-    /// Subscribe to the one topic this app listens on, if the user has turned it on.
-    ///
-    /// Called from the connect ack, inside the `activeClientToken` guard: a subscribe
-    /// from a client we have already replaced is the same bug class the token exists for.
-    /// Re-established on every reconnect, like discovery re-publication.
-    private func subscribeToRefreshTopic() {
-        guard let settings, settings.enableRefreshTrigger, let client else { return }
-        let topic = Self.refreshSyncTopic(prefix: settings.mqttTopicPrefix)
-        client.subscribe(topic, qos: .qos1)
-    }
-
-    /// Apply a change to the trigger setting now, rather than at the next connection.
-    ///
-    /// Both halves of this feature used to live in the connect ack alone, so switching
-    /// the setting on did nothing at all — no subscription, no button, and nothing in the
-    /// log — until the app reconnected or restarted. The user's next move is to go and
-    /// look for the button in Home Assistant, so the gap presented as the feature being
-    /// broken. Renaming an alias already applies at the moment of the action; this brings
-    /// the trigger into line with it.
-    func applyRefreshTriggerSetting(enabled: Bool, prefix: String) {
-        guard connectionState == .connected, let client else {
-            logger?.info("MQTT: not connected — sync requests will be set up on the next connection")
-            return
-        }
-
-        let topic = Self.refreshSyncTopic(prefix: prefix)
-        if enabled {
-            client.subscribe(topic, qos: .qos1)
-        } else {
-            client.unsubscribe(topic)
-            logger?.info("MQTT unsubscribed from \(topic)")
-        }
-
-        // Settle the button again against the new value: this is a deliberate second pass
-        // in one session, which the per-session latch would otherwise block.
-        settledRefreshButton = false
-        settleRefreshButton(client: client, enabled: enabled, prefix: prefix)
-    }
-
-    /// Decide what an inbound message means.
-    ///
-    /// Pure so the retained-message guard can be asserted on: it is the difference
-    /// between a working feature and the app relaunching Find My at apparently random
-    /// moments, and a delegate callback cannot be reached by a test.
-    private func handleInbound(topic: String, retained: Bool) {
-        guard let settings else { return }
-        let refreshTopic = Self.refreshSyncTopic(prefix: settings.mqttTopicPrefix)
-
-        switch Self.inboundOutcome(topic: topic, retained: retained, refreshTopic: refreshTopic) {
-        case .ignoredTopic:
-            logger?.debug("MQTT: ignoring a message on \(topic)")
-        case .droppedRetained:
-            // Never silent: this line is the only thing that could ever explain the
-            // symptom, and a silently ignored trigger is the same class of failure as a
-            // silently fired one.
-            logger?.warn("MQTT: dropped a retained message on \(topic). A retained press "
-                         + "would fire on every reconnect — republish it with retain off.")
-        case .refresh:
-            logger?.info("MQTT: refresh and sync requested on \(topic)")
-            onRefreshRequested?()
-        }
-    }
-
-    /// Publish the refresh button's discovery config, or clear it, once per session.
-    ///
-    /// Both directions, because a button left behind after the setting is switched off
-    /// presses into a topic nobody is listening on — which looks like the feature is
-    /// broken rather than off.
-    func settleRefreshButton(client: MQTTPublishing, enabled: Bool, prefix: String) {
-        guard !settledRefreshButton, let settings else { return }
-        settledRefreshButton = true
-
-        switch Self.refreshButtonAction(enabled: enabled,
-                                        wasPublished: settings.refreshButtonPublished) {
-        case .publish:
-            publishJSON(client: client,
-                        topic: Self.refreshButtonTopic(),
-                        payload: Self.refreshButtonPayload(topicPrefix: prefix),
-                        retain: true)
-            settings.refreshButtonPublished = true
-            logger?.info("MQTT discovery published for button.\(Self.refreshButtonId)")
-        case .clear:
-            send(client, empty: Self.refreshButtonTopic())
-            settings.refreshButtonPublished = false
-            logger?.info("MQTT: removed button.\(Self.refreshButtonId) — "
-                         + "Home Assistant requests are switched off")
-        case .none:
-            break
-        }
     }
 
     // MARK: - Status entity
@@ -788,7 +735,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
 
     /// A zero-length retained message — HA's signal to drop a discovered entity,
     /// and what removes the retained message from the broker.
-    private func send(_ client: MQTTPublishing, empty topic: String) {
+    func send(_ client: MQTTPublishing, empty topic: String) {
         client.send(CocoaMQTTMessage(topic: topic, string: "", qos: .qos1, retained: true))
     }
 
@@ -817,7 +764,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         logger?.info("MQTT battery sensor published for \(devId)")
     }
 
-    private func publishJSON(client: MQTTPublishing, topic: String, payload: [String: Any], retain: Bool) {
+    func publishJSON(client: MQTTPublishing, topic: String, payload: [String: Any], retain: Bool) {
         guard let json = Self.jsonString(payload) else {
             // Was a silent `return`. A payload that cannot be serialized is an entity
             // that never appears in Home Assistant, with nothing anywhere to say why.

@@ -197,6 +197,20 @@ final class SettingsStore: ObservableObject {
     /// would come back from a restart with entities unknown until something moved.
     @AppStorage("skipRepeatedLocations") var skipRepeatedLocations: Bool = false
 
+    /// How far a device must move before its update counts as a change, in metres.
+    ///
+    /// **Widens `skipRepeatedLocations`; it cannot switch it off.** 0 is the strictest
+    /// setting — identical coordinates only — because a zero meaning "publish everything"
+    /// would let a stale tracker republish forever, which is what suppression exists to
+    /// stop. The toggle owns on and off.
+    ///
+    /// Defaults to 0 so a movement threshold is always a deliberate choice: with
+    /// suppression on, silence is the dangerous failure, and it should not arrive by
+    /// default. Measured need, from three stationary runs on a live account: recompute
+    /// noise sits under a millimetre while positioning wobble reaches 1.4 m, so the useful
+    /// range is roughly 0.1 m to 5 m.
+    @AppStorage("minimumMovementMetres") var minimumMovementMetres: Double = 0
+
     /// Let Home Assistant ask for a refresh over MQTT, and publish a button to do it.
     ///
     /// **Default off, deliberately.** This is the first inbound control path in the

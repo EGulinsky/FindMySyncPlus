@@ -304,26 +304,131 @@ struct SyncStatusAndAvailabilityTests {
 
     // MARK: - Skipping repeated locations
 
+    private static func state(_ lat: Double, _ lon: Double,
+                              signature: String = "{}") -> MQTTClient.PublishedState {
+        MQTTClient.PublishedState(signature: signature, latitude: lat, longitude: lon)
+    }
+
+    /// Apple Park, matching the fixtures.
+    private static let baseLat = 37.3349
+    private static let baseLon = -122.0089
+
+    /// Metres north of the base point, using the same constant the app does.
+    private static func north(_ metres: Double) -> MQTTClient.PublishedState {
+        state(baseLat + metres / 111_320.0, baseLon)
+    }
+
     @Test("nothing is skipped while the setting is off")
     func skippingIsOptIn() {
-        #expect(MQTTClient.shouldSkipPublish(enabled: false, previous: "{}", current: "{}") == false)
+        #expect(MQTTClient.suppressionDecision(enabled: false,
+                                               previous: Self.north(0),
+                                               current: Self.north(0),
+                                               thresholdMetres: 5) == .publish)
     }
 
-    @Test("an identical payload is skipped and a changed one is not")
-    func skipsOnlyIdenticalPayloads() {
-        #expect(MQTTClient.shouldSkipPublish(enabled: true, previous: "{\"a\":1}",
-                                             current: "{\"a\":1}"))
-        #expect(MQTTClient.shouldSkipPublish(enabled: true, previous: "{\"a\":1}",
-                                             current: "{\"a\":2}") == false)
+    /// The primary use, and why 0 is the strictest setting rather than an escape hatch:
+    /// a stale tracker Apple never rewrites must stop republishing.
+    @Test("identical coordinates are skipped at a threshold of zero")
+    func identicalSuppressesAtZero() {
+        #expect(MQTTClient.suppressionDecision(enabled: true,
+                                               previous: Self.north(0),
+                                               current: Self.north(0),
+                                               thresholdMetres: 0) == .identical)
     }
 
-    /// The first run after a launch or a reconnect must send everything: retained
-    /// discovery is republished then, and a config with no state behind it is an empty
-    /// entity.
-    @Test("with no previous payload, everything publishes")
+    /// The off-by-one that would make the feature look enabled and do nothing: two
+    /// identical positions are 0 m apart, so `<` would never suppress at a threshold of 0.
+    @Test("a threshold of zero still publishes anything that moved at all")
+    func zeroPublishesAnyMovement() {
+        #expect(MQTTClient.suppressionDecision(enabled: true,
+                                               previous: Self.north(0),
+                                               current: Self.north(0.01),
+                                               thresholdMetres: 0) == .publish)
+    }
+
+    /// The row reads "Skip repeated locations", and a repeated location is the same place
+    /// again — so a fresh observation of an unchanged position is a repeat, whatever its
+    /// timestamp says. One rule at every threshold; the dial only sets how much movement
+    /// counts.
+    @Test("a fresher timestamp at unchanged coordinates is still a repeat")
+    func aNewTimestampAloneIsARepeat() {
+        let before = Self.state(Self.baseLat, Self.baseLon, signature: "{}")
+        let after = Self.state(Self.baseLat, Self.baseLon, signature: "{}")
+
+        #expect(MQTTClient.suppressionDecision(enabled: true, previous: before,
+                                               current: after,
+                                               thresholdMetres: 0) == .identical)
+    }
+
+    /// Measured on a live account, three stationary runs: an iPhone's recomputed fix moved
+    /// 0.01 mm while reporting 3 m accuracy.
+    @Test("recompute noise publishes at zero and suppresses at a tenth of a metre")
+    func recomputeNoiseSuppresses() {
+        let noise = 0.00001
+        #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
+                                               current: Self.north(noise),
+                                               thresholdMetres: 0) == .publish)
+        #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
+                                               current: Self.north(noise),
+                                               thresholdMetres: 0.1) != .publish)
+    }
+
+    /// The same measurement, one device over: a stationary Mac wandered 11 cm. This is why
+    /// the first threshold proposed — 1 cm — was wrong by two orders of magnitude.
+    @Test("an 11 cm wobble publishes at a tenth of a metre and suppresses at half")
+    func stationaryWobbleNeedsHalfAMetre() {
+        #expect(MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
+                                               current: Self.north(0.11),
+                                               thresholdMetres: 0.1) == .publish)
+
+        let decision = MQTTClient.suppressionDecision(enabled: true, previous: Self.north(0),
+                                                      current: Self.north(0.11),
+                                                      thresholdMetres: 0.5)
+        if case .withinThreshold(let moved) = decision {
+            #expect(abs(moved - 0.11) < 0.001)
+        } else {
+            Issue.record("an 11 cm move must suppress at a 0.5 m threshold")
+        }
+    }
+
+    /// A real attribute change publishes however wide the threshold — the position is the
+    /// only thing allowed to be approximately equal.
+    @Test("a battery change publishes even when the device has not moved")
+    func attributeChangeAlwaysPublishes() {
+        #expect(MQTTClient.suppressionDecision(
+            enabled: true,
+            previous: Self.state(Self.baseLat, Self.baseLon, signature: #"{"battery":87}"#),
+            current: Self.state(Self.baseLat, Self.baseLon, signature: #"{"battery":86}"#),
+            thresholdMetres: 50) == .publish)
+    }
+
+    /// The first run after a launch or a reconnect sends everything: retained discovery is
+    /// republished then, and a config with no state behind it is an empty entity.
+    @Test("with no previous state, everything publishes")
     func firstRunAlwaysPublishes() {
-        #expect(MQTTClient.shouldSkipPublish(enabled: true, previous: nil,
-                                             current: "{\"a\":1}") == false)
+        #expect(MQTTClient.suppressionDecision(enabled: true, previous: nil,
+                                               current: Self.north(0),
+                                               thresholdMetres: 5) == .publish)
+    }
+
+    /// Timestamps move whenever Apple rewrites a record, so leaving them in the exact
+    /// comparison would publish every recomputed fix whatever the threshold — the feature
+    /// would do nothing for the devices it exists to quiet.
+    @Test("the signature ignores position and time, and keeps everything else")
+    func signatureExcludesOnlyVolatileKeys() throws {
+        let attrs: [String: Any] = [
+            "latitude": 1.0, "longitude": 2.0, "gps_accuracy": 3.0,
+            "last_update": "then", "location_timestamp": "then",
+            "battery": 87, "separation_status": "together"
+        ]
+        let signature = try #require(MQTTClient.signature(of: attrs))
+
+        #expect(signature.contains("battery"))
+        #expect(signature.contains("separation_status"))
+        for volatile in ["latitude", "longitude", "gps_accuracy",
+                         "last_update", "location_timestamp"] {
+            #expect(!signature.contains(volatile), "\(volatile) must not decide suppression")
+        }
     }
 
     /// Key order must not decide whether an entity goes quiet.
@@ -487,10 +592,20 @@ struct SyncStatusAndAvailabilityTests {
         #expect(!first.contains("location_timestamp"),
                 "no fix time means no location_timestamp — a fabricated one would claim a reading")
 
-        // One sync interval later, the same unchanged record still publishes.
+        // A sync interval later the payload differs, because `last_update` fell back to the
+        // publish time — but suppression no longer reads it. Time-derived keys are excluded
+        // from the signature on purpose, so this record is judged on its position like any
+        // other, and an unmoved one is skipped.
         let later = try #require(MQTTClient.jsonString(
             client.buildAttributes(for: point, iso: iso,
                                    now: firstRun.addingTimeInterval(300))))
-        #expect(MQTTClient.shouldSkipPublish(enabled: true, previous: first, current: later) == false)
+        #expect(first != later, "last_update still moves, even though it no longer decides")
+
+        let signature = try #require(MQTTClient.signature(
+            of: client.buildAttributes(for: point, iso: iso, now: firstRun)))
+        let laterSignature = try #require(MQTTClient.signature(
+            of: client.buildAttributes(for: point, iso: iso,
+                                       now: firstRun.addingTimeInterval(300))))
+        #expect(signature == laterSignature)
     }
 }

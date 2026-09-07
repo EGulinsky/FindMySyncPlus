@@ -12,23 +12,6 @@ import CocoaMQTT
 // threshold, following `MQTTDiscoveryPayloads`.
 extension MQTTClient {
 
-    /// Whether this entity's payload is identical to the one already retained.
-    ///
-    /// Pure, because `post()` needs a live socket and so cannot be reached by a test at
-    /// all — the rule that decides whether an entity goes quiet must be assertable
-    /// somewhere. The failure mode being guarded is the reason: always-publish fails
-    /// loudly, with bad data someone notices, while suppression fails silently, with an
-    /// entity that stops updating and is discovered when it is needed.
-    ///
-    /// No previous payload always publishes, so the first run after a launch or a
-    /// reconnect sends everything.
-    nonisolated static func shouldSkipPublish(enabled: Bool,
-                                              previous: String?,
-                                              current: String) -> Bool {
-        guard enabled, let previous else { return false }
-        return previous == current
-    }
-
     /// The stored client id, or a fresh one when nothing is stored yet.
     ///
     /// Pure so it can be asserted on directly: the test target is hosted by the app
@@ -115,7 +98,11 @@ extension MQTTClient {
     /// is an entity silently going dark.
     enum AttributePublishOutcome {
         case published
-        case skippedUnchanged
+        /// Split by reason: "nothing changed" and "it moved less than you asked me to care
+        /// about" are different answers to "why did my entity go quiet", and only the
+        /// second is a decision the app made.
+        case skippedIdentical
+        case skippedWithinThreshold
         case failed
     }
 
@@ -124,5 +111,98 @@ extension MQTTClient {
         let prefix: String
         let iso: ISO8601DateFormatter
         let skipRepeats: Bool
+        let minimumMovementMetres: Double
+    }
+
+    // MARK: - Suppressing a position that has not meaningfully moved
+
+    /// What the last publish for one entity looked like.
+    ///
+    /// The position is held apart from the rest because the two are compared differently:
+    /// everything else has to match exactly, while the position only has to be close.
+    struct PublishedState {
+        let signature: String
+        let latitude: Double
+        let longitude: Double
+    }
+
+    enum SuppressionDecision: Equatable {
+        case publish
+        /// Same coordinates to the last decimal.
+        case identical
+        /// Moved, but no further than the threshold. Carries the distance, because a user
+        /// debugging silence needs to know how far it decided was near enough.
+        case withinThreshold(Double)
+    }
+
+    /// Attributes deliberately left out of the exact comparison.
+    ///
+    /// **Position**, because it is compared by distance instead — comparing it exactly is
+    /// what made suppression useless: three stationary runs on a live account moved every
+    /// actively-located device by between 0.01 mm and 1.4 m, all of it far inside the 3 m
+    /// accuracy those devices reported.
+    ///
+    /// **Time**, because `last_update` and `location_timestamp` change whenever Apple
+    /// rewrites a record — so leaving them in would mean any recomputed fix publishes,
+    /// whatever the threshold, and the feature would do nothing for exactly the devices it
+    /// is meant to quiet.
+    ///
+    /// The row reads "Skip repeated locations", and a repeated location is the same place
+    /// again — so the position decides, and a fresh observation of an unchanged position is
+    /// a repeat. The accepted consequence is that a skipped entity's timestamps stop
+    /// advancing in Home Assistant; app-level freshness lives on the status entity and the
+    /// Connected sensor.
+    nonisolated static let volatileAttributeKeys: Set<String> = [
+        "latitude", "longitude", "gps_accuracy", "altitude", "vertical_accuracy",
+        "speed", "course", "last_update", "location_timestamp"
+    ]
+
+    /// The payload minus everything that moves on its own, as a comparable string.
+    nonisolated static func signature(of attrs: [String: Any]) -> String? {
+        jsonString(attrs.filter { !volatileAttributeKeys.contains($0.key) })
+    }
+
+    /// Metres between two coordinates.
+    ///
+    /// Equirectangular rather than haversine: at the distances that decide this — under a
+    /// few metres — the two agree far beyond the precision of the inputs, and this one can
+    /// be read at a glance. A degree of latitude is ~111,320 m everywhere; a degree of
+    /// longitude shrinks by the cosine of the latitude, which is the only correction needed.
+    nonisolated static func metresBetween(_ fromLat: Double, _ fromLon: Double,
+                                          _ toLat: Double, _ toLon: Double) -> Double {
+        let metresPerDegreeLatitude = 111_320.0
+        let northing = (toLat - fromLat) * metresPerDegreeLatitude
+        let meanLatitude = ((fromLat + toLat) / 2) * .pi / 180
+        let easting = (toLon - fromLon) * metresPerDegreeLatitude * cos(meanLatitude)
+        return (northing * northing + easting * easting).squareRoot()
+    }
+
+    /// Whether this entity's update can be held back.
+    ///
+    /// **The toggle owns on and off; the threshold only ever widens.** A threshold of 0 is
+    /// the strictest setting rather than an escape hatch — identical coordinates only —
+    /// because a zero that meant "publish everything" would let a stale tracker republish
+    /// forever, which is the thing suppression exists to stop.
+    ///
+    /// The comparison is `<=`, not `<`. With `<`, a threshold of 0 would never suppress
+    /// anything, since two identical positions are 0 m apart: the feature would look
+    /// enabled and do nothing.
+    ///
+    /// No previous state always publishes, so the first run after a launch or a reconnect
+    /// sends everything.
+    nonisolated static func suppressionDecision(enabled: Bool,
+                                                previous: PublishedState?,
+                                                current: PublishedState,
+                                                thresholdMetres: Double) -> SuppressionDecision {
+        guard enabled, let previous else { return .publish }
+
+        // Any real attribute change — battery, charging, separation — publishes however
+        // wide the threshold. Only the position is allowed to be approximately equal.
+        guard previous.signature == current.signature else { return .publish }
+
+        let moved = metresBetween(previous.latitude, previous.longitude,
+                                  current.latitude, current.longitude)
+        if moved == 0 { return .identical }
+        return moved <= thresholdMetres ? .withinThreshold(moved) : .publish
     }
 }

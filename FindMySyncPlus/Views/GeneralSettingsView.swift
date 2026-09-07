@@ -17,6 +17,21 @@ struct GeneralSettingsView: View {
 
     private static let minIntervalMinutes = 1
     private static let maxIntervalMinutes = 180
+    // Capped at 50 rather than 100 so the dial cannot be set somewhere that hides movement
+    // across a property. Measured need: recompute noise is sub-millimetre and positioning
+    // wobble reaches 1.4 m, so the useful range is roughly 0.1 m to 5 m.
+    private static let minMovement: Double = 0
+    private static let maxMovement: Double = 50
+    private static let movementStep: Double = 0.5
+    private static let metresFormatter: NumberFormatter = {
+        let nf = NumberFormatter()
+        nf.numberStyle = .decimal
+        nf.minimum = 0
+        nf.maximum = 50
+        nf.minimumFractionDigits = 1
+        nf.maximumFractionDigits = 1
+        return nf
+    }()
     private static let minWaitSeconds = 1
     private static let maxWaitSeconds = 30
     private static let intFormatter: NumberFormatter = {
@@ -142,6 +157,9 @@ struct GeneralSettingsView: View {
     /// leaving the stored preference alone for anyone who switches transport later.
     private var isMQTT: Bool { settings.transportMode == .mqtt }
 
+    /// The threshold only widens suppression, so it means nothing until the toggle is on.
+    private var movementEnabled: Bool { isMQTT && settings.skipRepeatedLocations }
+
     private var publishingCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
@@ -150,32 +168,59 @@ struct GeneralSettingsView: View {
                         .font(.title3).fontWeight(.semibold)
 
                     InfoTip(message: """
-                        Skip repeated locations publishes an entity update only when \
-                        Find My has a fresh location, rather than on every sync.
-
                         Subscribing listens on an MQTT topic to trigger an ad-hoc Find My \
                         launch and run a single sync. Useful when combined with disabling \
                         Find My before each run to reduce system load.
+
+                        Skip repeated locations publishes an entity update only when \
+                        Find My reports a different location, rather than on every sync. \
+                        Minimum movement treats near-identical locations as unchanged; at \
+                        0, only exact coordinate matches are skipped. A skipped entity keeps \
+                        its last timestamps, so read Sync status for freshness.
                         """)
                     Spacer()
                 }
 
                 VStack(spacing: 10) {
                     SettingsToggleRow(
-                        label: "Skip repeated locations",
-                        isOn: isMQTT ? $settings.skipRepeatedLocations : .constant(false),
+                        label: "Subscribe to sync requests",
+                        isOn: isMQTT ? $settings.enableRefreshTrigger : .constant(false),
                         disabled: !isMQTT,
                         qualifier: isMQTT ? nil : "MQTT only"
                     )
                     SettingsToggleRow(
-                        label: "Subscribe to sync requests",
-                        isOn: isMQTT ? $settings.enableRefreshTrigger : .constant(false),
+                        label: "Skip repeated locations",
+                        isOn: isMQTT ? $settings.skipRepeatedLocations : .constant(false),
                         disabled: !isMQTT,
                         qualifier: isMQTT ? nil : "MQTT only"
                     )
                 }
                 .font(.body)
                 .padding(.top, 2)
+
+                // Last, and governed by the toggle above it — the shape "Wait (seconds)"
+                // already uses under "Launch Find My before each run".
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    (Text("Minimum movement ")
+                        .font(.body)
+                     + Text("(metres)").foregroundStyle(.secondary))
+                        .foregroundStyle(movementEnabled ? .primary : .secondary)
+
+                    Spacer()
+
+                    TextField("", value: $settings.minimumMovementMetres,
+                              formatter: Self.metresFormatter)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 64)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(!movementEnabled)
+
+                    Stepper("", value: $settings.minimumMovementMetres,
+                            in: Self.minMovement...Self.maxMovement,
+                            step: Self.movementStep)
+                        .labelsHidden()
+                        .disabled(!movementEnabled)
+                }
             }
         }
     }
