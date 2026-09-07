@@ -89,6 +89,47 @@ extension MQTTClient {
         ]
     }
 
+    nonisolated static let connectedSensorId = "findmysyncplus_connected"
+
+    nonisolated static func connectedDiscoveryTopic() -> String {
+        "homeassistant/binary_sensor/\(connectedSensorId)/config"
+    }
+
+    /// Is the app connected, as a state rather than as an absence.
+    ///
+    /// Reads the availability topic — the same retained `online`, the same `offline` on
+    /// quit, the same last will on a crash — as its `state_topic` instead of as an
+    /// `availability_topic`. Only the consumer changes.
+    ///
+    /// **Why a state and not availability.** Availability makes entities vanish, which
+    /// costs a tracker its last known position and costs the status entity every
+    /// diagnostic attribute at the moment those are most wanted. A state costs nothing and
+    /// buys two things availability cannot: it is a first-class automation trigger, and it
+    /// leaves the recorder a clean on/off history of disconnects and reconnects, where
+    /// unavailable periods are awkward to chart or query.
+    ///
+    /// `payload_on` / `payload_off` are required: a binary sensor defaults to `ON` / `OFF`.
+    ///
+    /// Carries no availability of its own — it has to stay readable to do its job, and its
+    /// `off` state comes from the broker's retained will.
+    nonisolated static func connectedPayload(topicPrefix: String) -> [String: Any] {
+        [
+            "name": "Connected",
+            "unique_id": connectedSensorId,
+            "default_entity_id": "binary_sensor.\(connectedSensorId)",
+            "state_topic": availabilityTopic(prefix: topicPrefix),
+            "payload_on": availabilityOnline,
+            "payload_off": availabilityOffline,
+            "device_class": "connectivity",
+            "device": [
+                "identifiers": ["findmysyncplus"],
+                "name": "FindMySync+",
+                "manufacturer": "Apple",
+                "model": "Find My"
+            ]
+        ]
+    }
+
     nonisolated static func statusStateTopic(prefix: String) -> String {
         "\(prefix)status/state"
     }
@@ -120,7 +161,10 @@ extension MQTTClient {
             "default_entity_id": "sensor.\(statusDevId)",
             "state_topic": statusStateTopic(prefix: topicPrefix),
             "json_attributes_topic": statusAttributesTopic(prefix: topicPrefix),
-            "availability_topic": availabilityTopic(prefix: topicPrefix),
+            // Deliberately no `availability_topic`. This entity exists to say why things
+            // are quiet; making it go quiet with everything else is self-defeating —
+            // `keys`, `full_disk_access`, `last_error` and the counts have to stay
+            // readable at exactly the moment the app has stopped.
             "device_class": "timestamp",
             "device": [
                 "identifiers": ["findmysyncplus"],
@@ -152,11 +196,12 @@ extension MQTTClient {
             // the resolved ID we log truthful.
             "default_entity_id": DeviceAlias.haEntityID(forDevId: devId),
             "json_attributes_topic": "\(topicPrefix)\(devId)/attributes",
-            // Without this a tracker holds its last known position forever when the
-            // Mac goes away, with nothing to say the app stopped. Existing installs
-            // pick it up at the next rediscovery, which a launch already does — no
-            // migration and no republish pass.
-            "availability_topic": availabilityTopic(prefix: topicPrefix),
+            // Deliberately no `availability_topic`. A tracker's job is to answer where
+            // something is, and a week-old `home` is usually still true — going
+            // unavailable would take the position away from presence automations that
+            // depend on it. Staleness is already reported per entity by
+            // `location_timestamp`, and whether the app is running is answered
+            // explicitly by the Connected sensor.
             "source_type": "gps",
             "device": [
                 "identifiers": ["findmysyncplus"],
@@ -189,6 +234,10 @@ extension MQTTClient {
             "unique_id": "\(devId)_battery",
             "default_entity_id": "sensor.\(haSlug(devId))_battery",
             "state_topic": attributesTopic(forDevId: devId, prefix: topicPrefix),
+            // The one place availability is kept. Unlike a position, a battery percentage
+            // decays: 87% from last week is a wrong reading rather than an old one, and it
+            // carries no timestamp beside it. An honest gap in the statistics graph beats
+            // a flat line the recorder will treat as real.
             "availability_topic": availabilityTopic(prefix: topicPrefix),
             // Guarded because the attributes payload omits `battery` whenever Apple
             // supplies none, which is transient rather than per-device. Unguarded,

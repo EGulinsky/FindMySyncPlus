@@ -37,9 +37,9 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// prefix with nothing left to clear it.
     private var availabilityTopicInUse: String?
 
-    /// Set once the status entity's discovery config has gone out this session, the
-    /// same per-session gate the trackers use.
-    private var publishedStatusDiscovery = false
+    /// Set once this session has published the app-level singletons — the status entity
+    /// and the Connected sensor. The same per-session gate the trackers use.
+    private var publishedAppEntities = false
 
     /// Set once this session has settled the refresh button — published when the trigger
     /// is on, cleared when it is off. Both directions run once, so flipping the setting
@@ -113,9 +113,10 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         }
         mqtt.keepAlive = 60
         mqtt.autoReconnect = false
-        // The last will, registered per connection: the broker publishes it if this
-        // Mac disappears without a clean DISCONNECT, so every entity referencing the
-        // topic goes unavailable instead of holding its last position forever.
+        // The last will, registered per connection: the broker publishes it if this Mac
+        // disappears without a clean DISCONNECT. That turns the Connected sensor off and
+        // takes the battery sensors unavailable, while trackers keep their last position
+        // and the status entity keeps its diagnostics.
         let availabilityTopic = Self.availabilityTopic(prefix: settings.mqttTopicPrefix)
         availabilityTopicInUse = availabilityTopic
         mqtt.willMessage = CocoaMQTTMessage(topic: availabilityTopic,
@@ -151,7 +152,7 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         connectingSince = nil
         publishedDiscoveryIds.removeAll()
         publishedBatterySensorIds.removeAll()
-        publishedStatusDiscovery = false
+        publishedAppEntities = false
         lastPublishedAttributes.removeAll()
     }
 
@@ -499,13 +500,21 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // connection and runs after the trackers, so the app-level entities land together.
         settleRefreshButton(client: client, enabled: refreshTriggerEnabled, prefix: prefix)
 
-        if !publishedStatusDiscovery {
+        if !publishedAppEntities {
             publishJSON(client: client,
                         topic: Self.statusDiscoveryTopic(),
                         payload: Self.statusPayload(topicPrefix: prefix),
                         retain: true)
-            publishedStatusDiscovery = true
-            logger?.info("MQTT discovery published for sensor.\(Self.statusDevId)")
+            // Published beside the status entity because both are app-level singletons
+            // with the same lifetime. It carries no state of its own: the availability
+            // topic it reads is already retained, so it resolves the moment HA subscribes.
+            publishJSON(client: client,
+                        topic: Self.connectedDiscoveryTopic(),
+                        payload: Self.connectedPayload(topicPrefix: prefix),
+                        retain: true)
+            publishedAppEntities = true
+            logger?.info("MQTT discovery published for sensor.\(Self.statusDevId) "
+                         + "and binary_sensor.\(Self.connectedSensorId)")
         }
 
         if let lastSuccessfulSync {
@@ -900,7 +909,7 @@ extension MQTTClient: CocoaMQTTDelegate {
                 self.reconnectTask?.cancel()
                 self.publishedDiscoveryIds.removeAll()
                 self.publishedBatterySensorIds.removeAll()
-                self.publishedStatusDiscovery = false
+                self.publishedAppEntities = false
                 self.settledRefreshButton = false
                 self.lastPublishedAttributes.removeAll()
                 self.publishAvailability(Self.availabilityOnline)

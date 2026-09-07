@@ -52,21 +52,47 @@ struct SyncStatusAndAvailabilityTests {
                 == "findmysyncplus/status/attributes")
     }
 
-    /// Without this a tracker holds its last known position forever once the Mac goes
-    /// away, with nothing to say the app stopped.
-    @Test("every discovery payload references the one availability topic")
-    func discoveryPayloadsCarryAvailability() throws {
-        let tracker = MQTTClient.discoveryPayload(devId: Self.devId,
-                                                  displayName: "Wallet",
-                                                  topicPrefix: Self.prefix)
+    /// Battery is the one entity where staleness is wrongness: a percentage decays, and
+    /// it carries no timestamp beside it, so an honest gap beats a flat line.
+    @Test("only the battery sensor goes unavailable")
+    func onlyBatteryCarriesAvailability() {
         let battery = MQTTClient.batterySensorPayload(devId: Self.devId,
                                                       displayName: "Wallet",
                                                       topicPrefix: Self.prefix)
+        #expect(battery["availability_topic"] as? String == "findmysyncplus/availability")
+    }
+
+    /// A tracker's job is to answer where something is, and a week-old `home` is usually
+    /// still true — presence automations depend on it surviving the Mac being off. The
+    /// status entity exists to say why things are quiet, so it must never go quiet itself.
+    @Test("trackers and the status entity keep their values when the app stops")
+    func trackersAndStatusNeverGoUnavailable() {
+        let tracker = MQTTClient.discoveryPayload(devId: Self.devId,
+                                                  displayName: "Wallet",
+                                                  topicPrefix: Self.prefix)
         let status = MQTTClient.statusPayload(topicPrefix: Self.prefix)
 
-        for payload in [tracker, battery, status] {
-            #expect(payload["availability_topic"] as? String == "findmysyncplus/availability")
-        }
+        #expect(tracker["availability_topic"] == nil)
+        #expect(status["availability_topic"] == nil)
+    }
+
+    /// Liveness as a state rather than an absence. It reads the same retained topic the
+    /// will writes, so it needs no publishing path of its own — and unlike availability it
+    /// leaves the recorder a chartable history of disconnects and reconnects.
+    @Test("the Connected sensor reads the availability topic as its state")
+    func connectedSensorShape() {
+        let payload = MQTTClient.connectedPayload(topicPrefix: Self.prefix)
+
+        #expect(MQTTClient.connectedDiscoveryTopic()
+                == "homeassistant/binary_sensor/findmysyncplus_connected/config")
+        #expect(payload["state_topic"] as? String == "findmysyncplus/availability")
+        #expect(payload["device_class"] as? String == "connectivity")
+        // Required: a binary sensor defaults to ON/OFF, which this topic never carries.
+        #expect(payload["payload_on"] as? String == "online")
+        #expect(payload["payload_off"] as? String == "offline")
+        // It has to stay readable to do its job.
+        #expect(payload["availability_topic"] == nil)
+        #expect(payload["object_id"] == nil)
     }
 
     @Test("the availability payloads are HA's own defaults, so no extra keys are needed")
@@ -102,11 +128,14 @@ struct SyncStatusAndAvailabilityTests {
     /// Retiring an alias works from an explicit list rather than sweeping the prefix,
     /// so the status entity is safe without an exemption. Asserted because the discovered
     /// button in the refresh-trigger spec *did* need one.
-    @Test("retirement never sweeps the status entity")
-    func retirementLeavesStatusAlone() {
+    @Test("retirement never sweeps the app-level singletons")
+    func retirementLeavesSingletonsAlone() {
+        let singletons = [MQTTClient.statusDevId,
+                          MQTTClient.connectedSensorId,
+                          MQTTClient.refreshButtonId]
         let tombstones = MQTTClient.tombstonesToPublish(
-            retired: ["findmy_old", MQTTClient.statusDevId],
-            liveDevIds: [MQTTClient.statusDevId]
+            retired: ["findmy_old"] + singletons,
+            liveDevIds: Set(singletons)
         )
         #expect(tombstones == ["findmy_old"])
     }
@@ -305,17 +334,6 @@ struct SyncStatusAndAvailabilityTests {
         #expect(payload["unique_id"] as? String == "findmysyncplus_refresh_sync")
         #expect(payload["default_entity_id"] as? String == "button.findmysyncplus_refresh_sync")
         #expect(payload["object_id"] == nil)
-    }
-
-    /// It has no alias, so the sweep that clears renamed or untracked entities must never
-    /// reach it.
-    @Test("retirement never sweeps the refresh button")
-    func retirementLeavesTheButtonAlone() {
-        let tombstones = MQTTClient.tombstonesToPublish(
-            retired: ["findmy_old", MQTTClient.refreshButtonId],
-            liveDevIds: [MQTTClient.refreshButtonId]
-        )
-        #expect(tombstones == ["findmy_old"])
     }
 
     /// Retained discovery outlives the app, so switching the trigger off has to clear a
