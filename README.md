@@ -46,6 +46,9 @@ Based on [FindMySync](https://github.com/MartinPham/FindMySync) and the decrypti
 - Tracks **Devices** (iPhone, Apple Watch), **Items** (AirTags), and **Friends**
 - **Two transport modes** — REST (`device_tracker/see`) or MQTT with Home Assistant auto-discovery
 - **MQTT rich attributes** — altitude, speed, course, motion state, location labels via `json_attributes_topic`
+- **MQTT sensors** — a status sensor reports the last successful sync as a timestamp, along with many attributes to understand the run and app state. A binary state sensor shows the connection status of FMS+
+- **Skip repeated locations** (MQTT) — publish an entity update only when Find My reports a different location, with a minimum movement threshold
+- **Refresh from Home Assistant** (MQTT) — an MQTT exposed button to launch Find My and runs one sync on demand from within Home Assistant
 - **Friend location tracking** — decrypts `LocalStorage.db` for live friend coordinates; family members already tracked via Devices are automatically deduplicated using Apple's universal person identifier (DSID)
 - **Device Manager** — assign friendly aliases to devices, items, and friends; aliases become stable HA entity IDs even as UUIDs rotate
 - **Grouped accessories** — AirPods Pro pairs (and similar) appear as a single Device Manager entry; sub-items (Case, Left Bud, Right Bud) can be revealed and aliased individually if needed. This grouping is within FindMySyncPlus — in Home Assistant every entity appears under a single `FindMySync+` device
