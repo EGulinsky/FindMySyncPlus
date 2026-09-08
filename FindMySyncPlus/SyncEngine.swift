@@ -2,7 +2,10 @@ import Foundation
 
 // MARK: - Supporting types
 
-enum RunKind: String { case none, scheduled, manual }
+/// `triggered` is a sync run asked for over MQTT. It is an ordinary run with the Find My
+/// relaunch forced on, which is the one thing it adds — the target user wants the per-run
+/// refresh off and still wants a way to ask for one.
+enum RunKind: String { case none, scheduled, manual, triggered }
 
 enum DeviceSource: String { case device, item, friend, group }
 
@@ -166,7 +169,7 @@ final class SyncEngine {
             guard await runPreflight(using: candidates, settings: settings, logger: logger, dryRun: dryRun) else { return }
         }
 
-        await refreshFindMyIfNeeded(settings: settings, logger: logger, dryRun: dryRun)
+        await refreshFindMyIfNeeded(kind: kind, settings: settings, logger: logger, dryRun: dryRun)
 
         let io = await readCaches(candidates: candidates, hasFMIPSources: hasFMIPSources,
                                   hasFriendSource: hasFriendSource, settings: settings, logger: logger)
@@ -240,8 +243,12 @@ final class SyncEngine {
         return list
     }
 
-    private func refreshFindMyIfNeeded(settings: SettingsStore, logger: LogStore, dryRun: Bool) async {
-        guard settings.autoLaunchKillFindMy else { return }
+    private func refreshFindMyIfNeeded(kind: RunKind, settings: SettingsStore,
+                                       logger: LogStore, dryRun: Bool) async {
+        // A triggered run refreshes whatever the toggle says. That is the entire point of
+        // the trigger: the refresh is otherwise all-runs-or-no-runs, and the person asking
+        // for it wants it off for the scheduled ones.
+        guard settings.autoLaunchKillFindMy || kind == .triggered else { return }
         if dryRun {
             logger.info("[DRY] Would refresh Find My (launch/kill)")
         } else {

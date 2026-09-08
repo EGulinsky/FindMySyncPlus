@@ -216,6 +216,116 @@ struct SyncStatusAndAvailabilityTests {
         #expect(first == second)
     }
 
+    // MARK: - The refresh trigger (#25)
+
+    @Test("the topic derives from the prefix, with nothing new to configure")
+    func refreshTopicDerivesFromPrefix() {
+        #expect(MQTTClient.refreshSyncTopic(prefix: Self.prefix) == "findmysyncplus/refresh_sync")
+        #expect(MQTTClient.refreshSyncTopic(prefix: "house/fms/") == "house/fms/refresh_sync")
+    }
+
+    /// The topic is the verb and the payload is ignored, so the only questions are which
+    /// topic it arrived on and whether the broker replayed it.
+    @Test("a message on any other topic is ignored")
+    func otherTopicsAreIgnored() {
+        #expect(MQTTClient.inboundOutcome(topic: "findmysyncplus/findmy_wallet/attributes",
+                                          retained: false,
+                                          refreshTopic: "findmysyncplus/refresh_sync")
+                == .ignoredTopic)
+    }
+
+    @Test("a live press on the refresh topic triggers a run")
+    func livePressTriggers() {
+        #expect(MQTTClient.inboundOutcome(topic: "findmysyncplus/refresh_sync",
+                                          retained: false,
+                                          refreshTopic: "findmysyncplus/refresh_sync")
+                == .refresh)
+    }
+
+    /// The trap this closes: a broker replays a retained message to every new subscriber
+    /// and we resubscribe on every reconnect, so one retained press becomes a Find My
+    /// relaunch on every reconnect forever — presenting as random launches with the cause
+    /// sitting on the broker rather than in our state.
+    @Test("a retained press is dropped rather than fired on every reconnect")
+    func retainedPressIsDropped() {
+        #expect(MQTTClient.inboundOutcome(topic: "findmysyncplus/refresh_sync",
+                                          retained: true,
+                                          refreshTopic: "findmysyncplus/refresh_sync")
+                == .droppedRetained)
+    }
+
+    /// `retain: false` on our own button is what keeps it out of that trap.
+    @Test("the discovered button pins retain off and is a singleton")
+    func refreshButtonShape() {
+        let payload = MQTTClient.refreshButtonPayload(topicPrefix: Self.prefix)
+
+        #expect(MQTTClient.refreshButtonTopic()
+                == "homeassistant/button/findmysyncplus_refresh_sync/config")
+        #expect(payload["retain"] as? Bool == false)
+        #expect(payload["command_topic"] as? String == "findmysyncplus/refresh_sync")
+        #expect(payload["unique_id"] as? String == "findmysyncplus_refresh_sync")
+        #expect(payload["default_entity_id"] as? String == "button.findmysyncplus_refresh_sync")
+        #expect(payload["object_id"] == nil)
+    }
+
+    /// It has no alias, so the sweep that clears renamed or untracked entities must never
+    /// reach it.
+    @Test("retirement never sweeps the refresh button")
+    func retirementLeavesTheButtonAlone() {
+        let tombstones = MQTTClient.tombstonesToPublish(
+            retired: ["findmy_old", MQTTClient.refreshButtonId],
+            liveDevIds: [MQTTClient.refreshButtonId]
+        )
+        #expect(tombstones == ["findmy_old"])
+    }
+
+    /// Retained discovery outlives the app, so switching the trigger off has to clear a
+    /// button published in an earlier session — but a user who never switched it on must
+    /// not pay an extra retained publish every session for a tombstone they do not need.
+    @Test("the button is cleared only if it was ever published")
+    func buttonIsClearedOnlyWhenItExists() {
+        #expect(MQTTClient.refreshButtonAction(enabled: true, wasPublished: false) == .publish)
+        #expect(MQTTClient.refreshButtonAction(enabled: true, wasPublished: true) == .publish)
+        #expect(MQTTClient.refreshButtonAction(enabled: false, wasPublished: true) == .clear)
+        #expect(MQTTClient.refreshButtonAction(enabled: false, wasPublished: false) == .none)
+    }
+
+    private static let epoch = Date(timeIntervalSince1970: 1_756_000_000)
+
+    @Test("a first request runs")
+    func firstTriggerRuns() {
+        #expect(AppModel.triggerOutcome(isPerformingRun: false, lastTriggeredAt: nil,
+                                        now: Self.epoch) == .run)
+    }
+
+    /// Drop, do not queue: a refresh already in flight means the fresh data is arriving
+    /// anyway, so a queued second run would relaunch Find My for data it already has.
+    @Test("a request during a run is dropped as busy")
+    func busyIsDropped() {
+        #expect(AppModel.triggerOutcome(isPerformingRun: true, lastTriggeredAt: nil,
+                                        now: Self.epoch) == .droppedBusy)
+    }
+
+    /// An automation loop must not be able to hammer Find My's kill/launch cycle.
+    @Test("a second request inside the floor is dropped, and one past it runs")
+    func debounceFloorHolds() {
+        #expect(AppModel.triggerOutcome(isPerformingRun: false,
+                                        lastTriggeredAt: Self.epoch,
+                                        now: Self.epoch.addingTimeInterval(59)) == .droppedTooSoon)
+        #expect(AppModel.triggerOutcome(isPerformingRun: false,
+                                        lastTriggeredAt: Self.epoch,
+                                        now: Self.epoch.addingTimeInterval(61)) == .run)
+    }
+
+    /// Busy and too-soon are different failures and must never share a line — a silent or
+    /// ambiguous drop relocates a fault rather than removing it.
+    @Test("busy wins over the floor, so the reason reported is the real one")
+    func busyTakesPrecedence() {
+        #expect(AppModel.triggerOutcome(isPerformingRun: true,
+                                        lastTriggeredAt: Self.epoch,
+                                        now: Self.epoch.addingTimeInterval(1)) == .droppedBusy)
+    }
+
     // MARK: - last_update carries the fix time
 
     private static func point(timestamp: Date?) -> DevicePoint {

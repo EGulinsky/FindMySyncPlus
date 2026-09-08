@@ -65,6 +65,8 @@ final class AppModel: NSObject, ObservableObject {
     /// The most recent `willSleep`, kept after the wake clears `sleepStartedAt`, so a run
     /// that a sleep landed inside can still say so once it finishes.
     private var lastSleepAt: Date?
+    /// When a refresh was last started from an MQTT trigger, for the debounce floor.
+    private var lastTriggeredRunAt: Date?
 
     /// The message behind the most recent fatal error, or `nil` if the last run was clean.
     ///
@@ -81,6 +83,9 @@ final class AppModel: NSObject, ObservableObject {
         self.logger = logger
         syncEngine.bind(settings: settings, logger: logger, app: self)
         logger.minimumLevel = settings.logLevel
+        // The client decides that a genuine request arrived; this object decides whether a
+        // run may start, which is state only it holds.
+        syncEngine.mqtt.onRefreshRequested = { [weak self] in self?.handleRefreshRequest() }
         observeSleepWake()
         settings.objectWillChange
             .map { settings.updateIntervalSec }
@@ -88,6 +93,17 @@ final class AppModel: NSObject, ObservableObject {
             .debounce(for: .milliseconds(1000), scheduler: DispatchQueue.main)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.rescheduleIfNeeded(reason: "Interval changed") }
+            .store(in: &cancellables)
+        // Same shape as the interval watcher above, and for the same reason:
+        // `objectWillChange` fires before the value settles, so the debounce is what makes
+        // the read correct. Without this the trigger setting took effect only at the next
+        // connection, which reads as the feature not working.
+        settings.objectWillChange
+            .map { settings.enableRefreshTrigger }
+            .removeDuplicates()
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in self?.applyRefreshTriggerSetting(enabled) }
             .store(in: &cancellables)
         settings.$logLevel
             .sink { [weak self] level in self?.logger?.minimumLevel = level }
@@ -381,9 +397,65 @@ final class AppModel: NSObject, ObservableObject {
 
     @discardableResult
     func runNowIfIdle() -> Bool {
-        if isPerformingRun { return false }
+        if isPerformingRun {
+            // Was a silent `return false`: the button did nothing and the log said
+            // nothing, which is indistinguishable from the button being broken.
+            logger?.info("Run Now ignored — a run is already in progress")
+            return false
+        }
         Task { await syncEngine.run(kind: .manual, dryRun: false) }
         return true
+    }
+
+    // MARK: - Refresh trigger
+
+    /// A triggered refresh within this many seconds of the last one is dropped, so a
+    /// Home Assistant automation loop cannot hammer Find My's kill/launch cycle.
+    nonisolated static let triggerMinimumIntervalSeconds: TimeInterval = 60
+
+    /// What to do with a refresh request. Separated so the two drop reasons can be
+    /// asserted on: they are different failures and must never share a log line.
+    enum TriggerOutcome: Equatable {
+        case run
+        case droppedBusy
+        case droppedTooSoon
+    }
+
+    /// Drop rather than queue. A refresh already in flight means the fresh data is on
+    /// its way regardless, so a queued second run would only relaunch Find My again for
+    /// data it already has.
+    nonisolated static func triggerOutcome(isPerformingRun: Bool,
+                                           lastTriggeredAt: Date?,
+                                           now: Date) -> TriggerOutcome {
+        if isPerformingRun { return .droppedBusy }
+        if let lastTriggeredAt,
+           now.timeIntervalSince(lastTriggeredAt) < triggerMinimumIntervalSeconds {
+            return .droppedTooSoon
+        }
+        return .run
+    }
+
+    /// Subscribe or unsubscribe, and publish or clear the button, the moment the setting
+    /// changes — rather than leaving it until the next connection.
+    private func applyRefreshTriggerSetting(_ enabled: Bool) {
+        guard let settings, settings.transportMode == .mqtt else { return }
+        syncEngine.mqtt.applyRefreshTriggerSetting(enabled: enabled,
+                                                   prefix: settings.mqttTopicPrefix)
+    }
+
+    private func handleRefreshRequest() {
+        switch Self.triggerOutcome(isPerformingRun: isPerformingRun,
+                                   lastTriggeredAt: lastTriggeredRunAt,
+                                   now: Date()) {
+        case .droppedBusy:
+            logger?.info("Refresh trigger ignored — a run is already in progress")
+        case .droppedTooSoon:
+            logger?.info("Refresh trigger ignored — less than "
+                         + "\(Int(Self.triggerMinimumIntervalSeconds))s since the last one")
+        case .run:
+            lastTriggeredRunAt = Date()
+            Task { await syncEngine.run(kind: .triggered, dryRun: false) }
+        }
     }
 
     func runDryIfIdle() -> Bool {

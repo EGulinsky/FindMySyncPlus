@@ -38,6 +38,57 @@ extension MQTTClient {
     nonisolated static let availabilityOnline = "online"
     nonisolated static let availabilityOffline = "offline"
 
+    /// The one topic this app listens on. **The topic is the verb; the payload is
+    /// ignored**, so there is nothing to parse or validate.
+    ///
+    /// `refresh_sync` rather than `refresh`: what it starts is an ordinary sync run with
+    /// the Find My relaunch forced on, and `refresh` alone would omit that it then reads
+    /// the caches and publishes. A topic string is API the moment someone writes an
+    /// automation against it, so the name is settled before it ships.
+    ///
+    /// Derived from `mqttTopicPrefix` like every other topic — no new configurable
+    /// string to type, validate, or let drift out of sync with the publish side.
+    nonisolated static func refreshSyncTopic(prefix: String) -> String {
+        "\(prefix)refresh_sync"
+    }
+
+    nonisolated static let refreshButtonId = "findmysyncplus_refresh_sync"
+
+    nonisolated static func refreshButtonTopic() -> String {
+        "homeassistant/button/\(refreshButtonId)/config"
+    }
+
+    /// A discovered button, so pressing it in Home Assistant is the whole setup.
+    ///
+    /// #25 asked for the button, not merely the topic: without it every user hand-writes
+    /// an automation against a string they first have to find in the README, which is the
+    /// difference between a feature and a documented internal.
+    ///
+    /// `retain: false` is load-bearing. A broker replays a retained message to every new
+    /// subscriber and we resubscribe on every reconnect, so one retained press would
+    /// become a Find My relaunch on every reconnect forever. Our own button cannot spring
+    /// that trap; a hand-written automation can, which is why the receive path drops
+    /// retained messages too.
+    ///
+    /// A singleton, like the status entity — it belongs to the app rather than to any
+    /// tracked object, so retired-alias cleanup must never sweep it.
+    nonisolated static func refreshButtonPayload(topicPrefix: String) -> [String: Any] {
+        [
+            "name": "Refresh and sync",
+            "unique_id": refreshButtonId,
+            "default_entity_id": "button.\(refreshButtonId)",
+            "command_topic": refreshSyncTopic(prefix: topicPrefix),
+            "retain": false,
+            "availability_topic": availabilityTopic(prefix: topicPrefix),
+            "device": [
+                "identifiers": ["findmysyncplus"],
+                "name": "FindMySync+",
+                "manufacturer": "Apple",
+                "model": "Find My"
+            ]
+        ]
+    }
+
     nonisolated static func statusStateTopic(prefix: String) -> String {
         "\(prefix)status/state"
     }

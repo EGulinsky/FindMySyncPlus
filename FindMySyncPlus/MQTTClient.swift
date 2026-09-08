@@ -41,6 +41,16 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// same per-session gate the trackers use.
     private var publishedStatusDiscovery = false
 
+    /// Set once this session has settled the refresh button — published when the trigger
+    /// is on, cleared when it is off. Both directions run once, so flipping the setting
+    /// cannot leave a button behind that presses into nothing.
+    private var settledRefreshButton = false
+
+    /// Called when a refresh is asked for over MQTT. Set by `AppModel`, which owns the
+    /// decision about whether a run may start; this object only decides that a genuine,
+    /// non-retained request arrived on the right topic.
+    var onRefreshRequested: (@MainActor () -> Void)?
+
     /// Last published attributes payload per devId, for suppressing repeats.
     ///
     /// Cleared on reconnect beside `publishedDiscoveryIds`: retained discovery is
@@ -369,6 +379,99 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         return .published
     }
 
+    // MARK: - Refresh trigger
+
+    /// Subscribe to the one topic this app listens on, if the user has turned it on.
+    ///
+    /// Called from the connect ack, inside the `activeClientToken` guard: a subscribe
+    /// from a client we have already replaced is the same bug class the token exists for.
+    /// Re-established on every reconnect, like discovery re-publication.
+    private func subscribeToRefreshTopic() {
+        guard let settings, settings.enableRefreshTrigger, let client else { return }
+        let topic = Self.refreshSyncTopic(prefix: settings.mqttTopicPrefix)
+        client.subscribe(topic, qos: .qos1)
+    }
+
+    /// Apply a change to the trigger setting now, rather than at the next connection.
+    ///
+    /// Both halves of this feature used to live in the connect ack alone, so switching
+    /// the setting on did nothing at all — no subscription, no button, and nothing in the
+    /// log — until the app reconnected or restarted. The user's next move is to go and
+    /// look for the button in Home Assistant, so the gap presented as the feature being
+    /// broken. Renaming an alias already applies at the moment of the action; this brings
+    /// the trigger into line with it.
+    func applyRefreshTriggerSetting(enabled: Bool, prefix: String) {
+        guard connectionState == .connected, let client else {
+            logger?.info("MQTT: not connected — sync requests will be set up on the next connection")
+            return
+        }
+
+        let topic = Self.refreshSyncTopic(prefix: prefix)
+        if enabled {
+            client.subscribe(topic, qos: .qos1)
+        } else {
+            client.unsubscribe(topic)
+            logger?.info("MQTT unsubscribed from \(topic)")
+        }
+
+        // Settle the button again against the new value: this is a deliberate second pass
+        // in one session, which the per-session latch would otherwise block.
+        settledRefreshButton = false
+        settleRefreshButton(client: client, enabled: enabled, prefix: prefix)
+    }
+
+    /// Decide what an inbound message means.
+    ///
+    /// Pure so the retained-message guard can be asserted on: it is the difference
+    /// between a working feature and the app relaunching Find My at apparently random
+    /// moments, and a delegate callback cannot be reached by a test.
+    private func handleInbound(topic: String, retained: Bool) {
+        guard let settings else { return }
+        let refreshTopic = Self.refreshSyncTopic(prefix: settings.mqttTopicPrefix)
+
+        switch Self.inboundOutcome(topic: topic, retained: retained, refreshTopic: refreshTopic) {
+        case .ignoredTopic:
+            logger?.debug("MQTT: ignoring a message on \(topic)")
+        case .droppedRetained:
+            // Never silent: this line is the only thing that could ever explain the
+            // symptom, and a silently ignored trigger is the same class of failure as a
+            // silently fired one.
+            logger?.warn("MQTT: dropped a retained message on \(topic). A retained press "
+                         + "would fire on every reconnect — republish it with retain off.")
+        case .refresh:
+            logger?.info("MQTT: refresh and sync requested on \(topic)")
+            onRefreshRequested?()
+        }
+    }
+
+    /// Publish the refresh button's discovery config, or clear it, once per session.
+    ///
+    /// Both directions, because a button left behind after the setting is switched off
+    /// presses into a topic nobody is listening on — which looks like the feature is
+    /// broken rather than off.
+    func settleRefreshButton(client: MQTTPublishing, enabled: Bool, prefix: String) {
+        guard !settledRefreshButton, let settings else { return }
+        settledRefreshButton = true
+
+        switch Self.refreshButtonAction(enabled: enabled,
+                                        wasPublished: settings.refreshButtonPublished) {
+        case .publish:
+            publishJSON(client: client,
+                        topic: Self.refreshButtonTopic(),
+                        payload: Self.refreshButtonPayload(topicPrefix: prefix),
+                        retain: true)
+            settings.refreshButtonPublished = true
+            logger?.info("MQTT discovery published for button.\(Self.refreshButtonId)")
+        case .clear:
+            send(client, empty: Self.refreshButtonTopic())
+            settings.refreshButtonPublished = false
+            logger?.info("MQTT: removed button.\(Self.refreshButtonId) — "
+                         + "Home Assistant requests are switched off")
+        case .none:
+            break
+        }
+    }
+
     // MARK: - Status entity
 
     /// Publish the sync status entity: its discovery config once per session, then its
@@ -385,11 +488,16 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     func publishStatus(_ report: SyncStatusReport,
                        lastSuccessfulSync: Date?,
                        prefix: String,
+                       refreshTriggerEnabled: Bool,
                        iso: ISO8601DateFormatter) {
         guard connectionState == .connected, let client else {
             logger?.debug("MQTT: not connected; status entity not published this run")
             return
         }
+
+        // Rides here because this is the one place per run that is known to have a live
+        // connection and runs after the trackers, so the app-level entities land together.
+        settleRefreshButton(client: client, enabled: refreshTriggerEnabled, prefix: prefix)
 
         if !publishedStatusDiscovery {
             publishJSON(client: client,
@@ -715,18 +823,6 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         client.send(CocoaMQTTMessage(topic: topic, string: json, qos: .qos1, retained: retain))
     }
 
-    /// A payload as the exact string that goes on the wire.
-    ///
-    /// `sortedKeys` so two serializations of equal content are byte-identical —
-    /// without it, comparing this run's payload against the last one would depend on
-    /// dictionary ordering rather than on whether anything changed.
-    nonisolated static func jsonString(_ payload: [String: Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload,
-                                                     options: [.sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        return json
-    }
-
     /// Exponential from 250ms: 0.25, 0.5, 1, 2, 4, 8, 16, 32, 60…
     ///
     /// The faults this recovers from are short. macOS denies local network access with
@@ -754,38 +850,6 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
             return false        // an attempt is genuinely in flight
         }
         return true
-    }
-
-    /// Whether this entity's payload is identical to the one already retained.
-    ///
-    /// Pure, because `post()` needs a live socket and so cannot be reached by a test at
-    /// all — the rule that decides whether an entity goes quiet must be assertable
-    /// somewhere. The failure mode being guarded is the reason: always-publish fails
-    /// loudly, with bad data someone notices, while suppression fails silently, with an
-    /// entity that stops updating and is discovered when it is needed.
-    ///
-    /// No previous payload always publishes, so the first run after a launch or a
-    /// reconnect sends everything.
-    nonisolated static func shouldSkipPublish(enabled: Bool,
-                                              previous: String?,
-                                              current: String) -> Bool {
-        guard enabled, let previous else { return false }
-        return previous == current
-    }
-
-    /// The stored client id, or a fresh one when nothing is stored yet.
-    ///
-    /// Pure so it can be asserted on directly: the test target is hosted by the app
-    /// bundle and shares the user's real UserDefaults, so a test must never build a
-    /// `SettingsStore` to check that the id is stable. The caller writes the result
-    /// back when it differs from what it passed in.
-    ///
-    /// **What a stable id does and does not buy.** CocoaMQTT defaults `cleanSession`
-    /// to true and we never override it, so no session is resumed either way, and the
-    /// last will is registered per connection, so availability works regardless. What
-    /// it buys is one identity on the broker instead of one per launch.
-    nonisolated static func resolveClientId(stored: String) -> String {
-        stored.isEmpty ? "FindMySyncPlus-\(UUID().uuidString.prefix(8))" : stored
     }
 
     nonisolated static func backoffDelay(forAttempt attempt: Int) -> TimeInterval {
@@ -837,8 +901,10 @@ extension MQTTClient: CocoaMQTTDelegate {
                 self.publishedDiscoveryIds.removeAll()
                 self.publishedBatterySensorIds.removeAll()
                 self.publishedStatusDiscovery = false
+                self.settledRefreshButton = false
                 self.lastPublishedAttributes.removeAll()
                 self.publishAvailability(Self.availabilityOnline)
+                self.subscribeToRefreshTopic()
                 self.logger?.info("MQTT connected (discovery will re-publish)")
             } else {
                 self.logger?.error("MQTT connection rejected: \(ackDesc)")
@@ -866,8 +932,33 @@ extension MQTTClient: CocoaMQTTDelegate {
 
     nonisolated func mqtt(_ mqtt: CocoaMQTT, didPublishMessage message: CocoaMQTTMessage, id: UInt16) {}
     nonisolated func mqtt(_ mqtt: CocoaMQTT, didPublishAck id: UInt16) {}
-    nonisolated func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {}
-    nonisolated func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {}
+    nonisolated func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {
+        // Read what is needed on this side: `CocoaMQTTMessage` is not Sendable, and the
+        // topic and the retained flag are the whole of what the decision uses.
+        let topic = message.topic
+        let retained = message.retained
+        let token = ObjectIdentifier(mqtt)
+        Task { @MainActor in
+            guard token == self.activeClientToken else { return }
+            self.handleInbound(topic: topic, retained: retained)
+        }
+    }
+
+    nonisolated func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {
+        let subscribed = success.allKeys.compactMap { $0 as? String }.sorted()
+        let token = ObjectIdentifier(mqtt)
+        Task { @MainActor in
+            guard token == self.activeClientToken else { return }
+            for topic in subscribed {
+                self.logger?.info("MQTT subscribed to \(topic)")
+            }
+            // A subscription that failed means the button and any automation are dead with
+            // nothing to say so.
+            for topic in failed {
+                self.logger?.warn("MQTT: subscription to \(topic) was refused by the broker")
+            }
+        }
+    }
     nonisolated func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeTopics topics: [String]) {}
     nonisolated func mqttDidPing(_ mqtt: CocoaMQTT) {}
     nonisolated func mqttDidReceivePong(_ mqtt: CocoaMQTT) {}

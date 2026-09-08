@@ -146,30 +146,36 @@ struct GeneralSettingsView: View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("Publishing")
+                    Text("Home Assistant")
                         .font(.title3).fontWeight(.semibold)
 
                     InfoTip(message: """
-                        Control what reaches Home Assistant when Find My \
-                        reports the same position again.
+                        Skip repeated locations updates an entity only when Find My has \
+                        an updated location, as opposed to publishing on every sync.
+
+                        Subscribing listens on an MQTT topic to trigger an ad-hoc Find My \
+                        launch and run a single sync. Useful when combined with disabling \
+                        Find My before each run to reduce system load.
                         """)
                     Spacer()
                 }
 
-                SettingsToggleRow(
-                    label: "Skip repeated locations",
-                    isOn: isMQTT ? $settings.skipRepeatedLocations : .constant(false),
-                    disabled: !isMQTT,
-                    qualifier: isMQTT ? nil : "MQTT only"
-                )
-
-                Text("""
-                    Publish a tracker only when Find My has something new for it. \
-                    Home Assistant's own "last updated" then means the device was \
-                    actually seen, rather than that the sync ran.
-                    """)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 10) {
+                    SettingsToggleRow(
+                        label: "Skip repeated locations",
+                        isOn: isMQTT ? $settings.skipRepeatedLocations : .constant(false),
+                        disabled: !isMQTT,
+                        qualifier: isMQTT ? nil : "MQTT only"
+                    )
+                    SettingsToggleRow(
+                        label: "Subscribe to sync requests",
+                        isOn: isMQTT ? $settings.enableRefreshTrigger : .constant(false),
+                        disabled: !isMQTT,
+                        qualifier: isMQTT ? nil : "MQTT only"
+                    )
+                }
+                .font(.body)
+                .padding(.top, 2)
             }
         }
     }

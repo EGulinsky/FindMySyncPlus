@@ -197,6 +197,26 @@ final class SettingsStore: ObservableObject {
     /// would come back from a restart with entities unknown until something moved.
     @AppStorage("skipRepeatedLocations") var skipRepeatedLocations: Bool = false
 
+    /// Let Home Assistant ask for a refresh over MQTT, and publish a button to do it.
+    ///
+    /// **Default off, deliberately.** This is the first inbound control path in the
+    /// product — MQTT has been publish-only — and a category change of that kind warrants
+    /// explicit consent rather than arriving silently in a release. The argument against a
+    /// toggle was that the broker is already fully trusted, and anyone with write access
+    /// can already spoof every entity's position; that is true and was overruled anyway.
+    ///
+    /// The consequence to accept is that a fresh install has this off and an automation
+    /// written against the topic will not work until its author finds this row.
+    @AppStorage("enableRefreshTrigger") var enableRefreshTrigger: Bool = false
+
+    /// Whether the discovered refresh button is currently on the broker.
+    ///
+    /// Retained discovery outlives the app, so switching the trigger off has to clear a
+    /// button that was published in an earlier session — and knowing whether there is one
+    /// is the difference between a targeted tombstone and an extra retained publish every
+    /// session for every user who never turned the feature on.
+    @AppStorage("refreshButtonPublished") var refreshButtonPublished: Bool = false
+
     // Menu Bar options
 
     @AppStorage("deviceAliasesJSON") private var deviceAliasesJSON: String = "[]"

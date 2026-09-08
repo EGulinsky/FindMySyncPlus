@@ -60,6 +60,7 @@ extension SyncEngine {
         mqtt.publishStatus(report,
                            lastSuccessfulSync: app.lastSuccessfulSync,
                            prefix: settings.mqttTopicPrefix,
+                           refreshTriggerEnabled: settings.enableRefreshTrigger,
                            iso: ISO8601DateFormatter())
     }
 }
