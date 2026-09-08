@@ -1,4 +1,5 @@
 import Foundation
+import CocoaMQTT
 
 // The decisions MQTT publishing makes, separated from the connection that acts on them.
 //
@@ -87,5 +88,41 @@ extension MQTTClient {
                                                      options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return nil }
         return json
+    }
+
+    /// The last will: retained `offline` on the availability topic.
+    ///
+    /// **Quitting deliberately does not send a clean DISCONNECT.** It used to publish
+    /// `offline` and then close, and the frame never reached the broker — the socket went
+    /// down in the same turn, and neither a runloop spin nor a blocking sleep could flush
+    /// it. The will is the mechanism MQTT provides for exactly this, so quitting now takes
+    /// the same path as a crash or a pulled cable: one behaviour, no race.
+    ///
+    /// Extracted so the shape can be asserted without a socket. It is the only thing
+    /// standing between a quit and a retained `online` that never clears, and the demo
+    /// broker implements no wills, so nothing else can check it.
+    nonisolated static func willMessage(prefix: String) -> CocoaMQTTMessage {
+        CocoaMQTTMessage(topic: availabilityTopic(prefix: prefix),
+                         string: availabilityOffline,
+                         qos: .qos1,
+                         retained: true)
+    }
+
+    /// What happened to one device's attributes this cycle.
+    ///
+    /// Three outcomes rather than a `Bool`, because a skip and a failure are opposite
+    /// things that both mean "nothing went out": one is the feature working, the other
+    /// is an entity silently going dark.
+    enum AttributePublishOutcome {
+        case published
+        case skippedUnchanged
+        case failed
+    }
+
+    /// The parts of a publish cycle that are the same for every device in it.
+    struct AttributeCycle {
+        let prefix: String
+        let iso: ISO8601DateFormatter
+        let skipRepeats: Bool
     }
 }

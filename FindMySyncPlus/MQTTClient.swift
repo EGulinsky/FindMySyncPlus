@@ -61,6 +61,11 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// When the in-flight attempt started, so a stalled one is replaced rather than
     /// leaving the client wedged in `.connecting`.
     private var connectingSince: Date?
+
+    /// How long the client is kept alive after saying `offline`, so its queued writes
+    /// reach the socket before it is released.
+    nonisolated static let goodbyeGraceMilliseconds = 500
+
     nonisolated static let connectingTimeout: TimeInterval = 15
 
     /// Sized so the whole retry chain (0.25 + 0.5 + 1 + 2 + 4 + 8 + 16 ≈ 32s) finishes
@@ -86,7 +91,9 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     ///   pre-flight, the connection test), which starts a fresh retry schedule. `false`
     ///   for a scheduled reconnect, which must keep advancing the existing one.
     func connect(settings: SettingsStore, resetBackoff: Bool = true) {
-        disconnect(resetBackoff: resetBackoff)
+        // `announce: false` — tearing down to reconnect is not going away, and saying
+        // offline here would flap the Connected sensor on every retry.
+        disconnect(resetBackoff: resetBackoff, announce: false)
         intentionalDisconnect = false
         guard !settings.mqttHost.isEmpty else {
             logger?.warn("MQTT: host not configured")
@@ -117,12 +124,8 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // disappears without a clean DISCONNECT. That turns the Connected sensor off and
         // takes the battery sensors unavailable, while trackers keep their last position
         // and the status entity keeps its diagnostics.
-        let availabilityTopic = Self.availabilityTopic(prefix: settings.mqttTopicPrefix)
-        availabilityTopicInUse = availabilityTopic
-        mqtt.willMessage = CocoaMQTTMessage(topic: availabilityTopic,
-                                            string: Self.availabilityOffline,
-                                            qos: .qos1,
-                                            retained: true)
+        availabilityTopicInUse = Self.availabilityTopic(prefix: settings.mqttTopicPrefix)
+        mqtt.willMessage = Self.willMessage(prefix: settings.mqttTopicPrefix)
         if settings.mqttUseTLS {
             mqtt.enableSSL = true
             mqtt.allowUntrustCACertificate = true
@@ -137,7 +140,21 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         _ = mqtt.connect()
     }
 
-    func disconnect(resetBackoff: Bool = true) {
+    /// - Parameter announce: whether to say `offline` before closing. Quitting passes
+    ///   `false` and relies on the will instead, having nothing it can wait for.
+    func disconnect(resetBackoff: Bool = true, announce: Bool = true) {
+        // Say we are going before we go. A clean DISCONNECT makes the broker discard the
+        // will, so without this the retained `online` outlives the connection and Home
+        // Assistant reads Connected while the app's own status light reads disconnected —
+        // the two disagreeing about the same fact.
+        //
+        // Every intentional close lands here: the scheduler stopping, the idle release
+        // after a user action, a connection test tearing itself down, and quitting. An
+        // unexpected drop leaves no client to publish through and is covered by the will.
+        let announcing = announce && connectionState == .connected
+        if announcing {
+            publishAvailability(Self.availabilityOffline)
+        }
         intentionalDisconnect = true
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -145,7 +162,24 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
         // tears the client down too, and resetting here would pin every attempt at the
         // first delay — an endless fast loop that never backs off or gives up.
         if resetBackoff { reconnectAttempts = 0 }
-        client?.disconnect()
+        if announcing, let dying = client {
+            // Hold the client alive until its writes land. Both the `offline` publish and
+            // the DISCONNECT frame are handed to CocoaMQTT and written asynchronously, so
+            // dropping the last reference in this same turn can deallocate it before
+            // either reaches the socket. Measured: the app logged `offline` at 5:30:37 and
+            // Home Assistant did not react until 5:32:56 — a keepalive timeout firing the
+            // will, which is what happens when the broker receives neither frame.
+            //
+            // Safe on this path only: the scheduler stopping or an idle release, where the
+            // process stays alive and no reconnect follows. Quitting can wait for nothing
+            // and relies on the will by design.
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(Self.goodbyeGraceMilliseconds))
+                dying.disconnect()
+            }
+        } else {
+            client?.disconnect()
+        }
         client = nil
         activeClientToken = nil
         connectionState = .disconnected
@@ -163,37 +197,41 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// Retained on purpose: a subscriber that connects later must learn the current
     /// state rather than wait for the next transition.
     private func publishAvailability(_ state: String) {
-        guard let client, let topic = availabilityTopicInUse else { return }
-        client.send(CocoaMQTTMessage(topic: topic, string: state, qos: .qos1, retained: true))
+        guard let target = availabilityPublisher, let topic = availabilityTopicInUse else {
+            // Silence here left a user with no way to tell "the app never said it" from
+            // "the broker never delivered it" — the only two explanations for Home
+            // Assistant still reading Connected, and they need opposite fixes.
+            logger?.warn("MQTT: could not publish \(state) — no live connection to announce on")
+            return
+        }
+        target.send(CocoaMQTTMessage(topic: topic, string: state, qos: .qos1, retained: true))
+        logger?.info("MQTT: published \(state) to \(topic)")
     }
 
-    /// Say `offline` and disconnect, for an app that is quitting.
+    /// Where availability goes. Normally the socket; in tests, a recorder.
     ///
-    /// **The will alone is not enough.** The broker publishes a will only when the
-    /// connection drops *without* a DISCONNECT packet; a clean quit sends one, the
-    /// will is discarded, and the retained `online` stands forever. Availability
-    /// would then cover a crash or a pulled cable and miss the ordinary case of
-    /// quitting the app.
-    ///
-    /// **The trigger is termination, not `stop()`.** The scheduler stopping is not
-    /// the app going away — publishing `offline` from there would say the app is gone
-    /// while it is sitting on screen.
-    func publishOfflineForTermination() {
-        guard connectionState == .connected, client != nil else { return }
-        publishAvailability(Self.availabilityOffline)
-        logger?.info("MQTT: published offline before quitting")
-        // The publish is queued on the socket's own queue, and the process is about to
-        // exit. `disconnect()` queues DISCONNECT behind it, so the ordering is right;
-        // what is missing is time for either to reach the wire. A short bounded spin
-        // is the whole remedy — without it the retained `online` can survive a clean
-        // quit, which is the exact case this method exists for.
-        disconnect()
-        RunLoop.current.run(until: Date().addingTimeInterval(Self.terminationFlushSeconds))
+    /// The seam exists because `connect()` and `disconnect()` hold a concrete `CocoaMQTT`,
+    /// which no test can build — so the connection *lifecycle* had no coverage at all,
+    /// and "does stopping tell Home Assistant" was a question nothing could ask. Shipping
+    /// a retained `online` that outlived the connection is what that gap cost.
+    private var availabilityPublisher: MQTTPublishing? {
+        #if DEBUG
+        if let testPublisher { return testPublisher }
+        #endif
+        return client
     }
 
-    /// Long enough for a queued PUBLISH and DISCONNECT to leave the socket, short
-    /// enough that quitting still feels immediate.
-    nonisolated static let terminationFlushSeconds: TimeInterval = 0.3
+    #if DEBUG
+    private var testPublisher: MQTTPublishing?
+
+    /// Stand a recorder in for the socket and declare the connection live, so the
+    /// lifecycle can be asserted on. Mirrors `setReconnectAttemptsForTesting`.
+    func setConnectedForTesting(publisher: MQTTPublishing, prefix: String) {
+        testPublisher = publisher
+        availabilityTopicInUse = Self.availabilityTopic(prefix: prefix)
+        connectionState = .connected
+    }
+    #endif
 
     func ensureConnected(settings: SettingsStore) async -> Bool {
         if connectionState == .connected { return true }
@@ -329,17 +367,6 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
                            skippedUnchangedCount: skippedUnchangedCount)
     }
 
-    /// What happened to one device's attributes this cycle.
-    ///
-    /// Three outcomes rather than a `Bool`, because a skip and a failure are opposite
-    /// things that both mean "nothing went out": one is the feature working, the other
-    /// is an entity silently going dark.
-    enum AttributePublishOutcome {
-        case published
-        case skippedUnchanged
-        case failed
-    }
-
     /// Build and publish one device's attributes, skipping a payload identical to the
     /// one already retained on the broker.
     ///
@@ -348,13 +375,6 @@ final class MQTTClient: NSObject, ObservableObject, TransportClient {
     /// see `buildAttributes`. A record Apple gives no timestamp for keeps the publish
     /// time and so never matches itself, which is the safe direction: it publishes,
     /// loudly, rather than going quiet on a record we cannot reason about.
-    /// The parts of a publish cycle that are the same for every device in it.
-    struct AttributeCycle {
-        let prefix: String
-        let iso: ISO8601DateFormatter
-        let skipRepeats: Bool
-    }
-
     private func publishAttributes(client: MQTTPublishing,
                                    device: DevicePoint,
                                    devId: String,

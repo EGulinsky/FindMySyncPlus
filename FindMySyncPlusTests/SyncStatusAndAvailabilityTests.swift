@@ -107,6 +107,56 @@ struct SyncStatusAndAvailabilityTests {
         #expect(tracker["payload_not_available"] == nil)
     }
 
+    // MARK: - The connection lifecycle
+    //
+    // These exist because the bug they guard shipped: the scheduler was stopped, the app's
+    // own status light read disconnected, and Home Assistant went on reading Connected —
+    // because a clean DISCONNECT makes the broker discard the will, so the retained
+    // `online` stood. Nothing could ask the question before, since `disconnect()` holds a
+    // concrete `CocoaMQTT`.
+
+    /// Every intentional close routes through `disconnect()`: the scheduler stopping, the
+    /// idle release after a user action, a connection test tearing itself down, quitting.
+    @Test("disconnecting says offline, rather than leaving a retained online behind")
+    func disconnectAnnouncesOffline() throws {
+        let recorder = RecordingPublisher()
+        let client = MQTTClient()
+        client.setConnectedForTesting(publisher: recorder, prefix: Self.prefix)
+
+        client.disconnect()
+
+        #expect(recorder.topics == ["findmysyncplus/availability"])
+        let message = try #require(recorder.messages.first)
+        #expect(message.string == "offline")
+        // Unretained, the broker tells no future subscriber anything.
+        #expect(message.retained, "an unretained offline leaves the last retained online standing")
+    }
+
+    /// The other half, and the only guard there is for it: quitting sends no clean
+    /// DISCONNECT, so the broker fires this. The demo broker implements no wills, so
+    /// nothing downstream can check it — an explicit publish at quit was tried and the
+    /// frame never reached the wire, because the socket closed in the same turn.
+    @Test("the will says offline, retained, on the availability topic")
+    func willAnnouncesOffline() {
+        let will = MQTTClient.willMessage(prefix: Self.prefix)
+
+        #expect(will.topic == "findmysyncplus/availability")
+        #expect(will.string == "offline")
+        #expect(will.retained, "an unretained will tells no future subscriber anything")
+    }
+
+    /// An unexpected drop leaves no client to publish through, and the broker's will
+    /// covers it. Announcing from a connection that was never up would be a lie.
+    @Test("disconnecting when nothing is connected publishes nothing")
+    func disconnectWhileIdleIsSilent() {
+        let recorder = RecordingPublisher()
+        let client = MQTTClient()
+
+        client.disconnect()
+
+        #expect(recorder.messages.isEmpty)
+    }
+
     // MARK: - Status entity
 
     /// A singleton, not a devId — which is why retired-alias cleanup never sweeps it.

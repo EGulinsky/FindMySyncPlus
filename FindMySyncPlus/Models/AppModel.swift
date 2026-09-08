@@ -65,6 +65,8 @@ final class AppModel: NSObject, ObservableObject {
     /// The most recent `willSleep`, kept after the wake clears `sleepStartedAt`, so a run
     /// that a sleep landed inside can still say so once it finishes.
     private var lastSleepAt: Date?
+    /// The trigger setting as last applied, so the watcher acts on changes only.
+    private var appliedRefreshTrigger = false
     /// When a refresh was last started from an MQTT trigger, for the debounce floor.
     private var lastTriggeredRunAt: Date?
 
@@ -86,6 +88,9 @@ final class AppModel: NSObject, ObservableObject {
         // The client decides that a genuine request arrived; this object decides whether a
         // run may start, which is state only it holds.
         syncEngine.mqtt.onRefreshRequested = { [weak self] in self?.handleRefreshRequest() }
+        // Seeded from what is already stored, so the watcher below reports changes rather
+        // than announcing the launch value as one.
+        appliedRefreshTrigger = settings.enableRefreshTrigger
         observeSleepWake()
         settings.objectWillChange
             .map { settings.updateIntervalSec }
@@ -323,13 +328,7 @@ final class AppModel: NSObject, ObservableObject {
         let workspace = NSWorkspace.shared.notificationCenter
         sleepObservers = [
             observe(workspace, NSWorkspace.willSleepNotification) { [weak self] in self?.noteSleep() },
-            observe(workspace, NSWorkspace.didWakeNotification) { [weak self] in self?.noteWake() },
-            // Availability's other half. The broker discards the will on a clean quit, so
-            // without this the retained `online` outlives the app and every entity reads
-            // available forever.
-            observe(.default, NSApplication.willTerminateNotification) { [weak self] in
-                self?.noteTermination()
-            }
+            observe(workspace, NSWorkspace.didWakeNotification) { [weak self] in self?.noteWake() }
         ]
     }
 
@@ -354,11 +353,6 @@ final class AppModel: NSObject, ObservableObject {
         let slept = sleepStartedAt.map { " after \(Int(Date().timeIntervalSince($0) / 60))m" } ?? ""
         sleepStartedAt = nil
         logger?.info("System woke\(slept)")
-    }
-
-    private func noteTermination() {
-        guard let settings, settings.transportMode == .mqtt else { return }
-        syncEngine.mqtt.publishOfflineForTermination()
     }
 
     /// Whether a sleep landed inside a run that began at `runStartedAt`.
@@ -438,6 +432,12 @@ final class AppModel: NSObject, ObservableObject {
     /// Subscribe or unsubscribe, and publish or clear the button, the moment the setting
     /// changes — rather than leaving it until the next connection.
     private func applyRefreshTriggerSetting(_ enabled: Bool) {
+        // `removeDuplicates()` lets the first emission through, having nothing to compare
+        // it against — so every launch applied the stored value as though the user had
+        // just set it, unsubscribing from a topic never subscribed to and logging that it
+        // had. Only a genuine change is worth acting on.
+        guard enabled != appliedRefreshTrigger else { return }
+        appliedRefreshTrigger = enabled
         guard let settings, settings.transportMode == .mqtt else { return }
         syncEngine.mqtt.applyRefreshTriggerSetting(enabled: enabled,
                                                    prefix: settings.mqttTopicPrefix)
