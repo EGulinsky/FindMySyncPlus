@@ -541,9 +541,18 @@ final class AppModel: NSObject, ObservableObject {
     // MARK: - Error/warning handlers
 
     private func handleFatalError(_ message: String) {
-        stop()
+        // Used to call stop() here: any single `.error()`-level log line, anywhere in
+        // the app, killed the whole scheduler — cancelling the file watcher and
+        // disconnecting MQTT — until the app was relaunched. A transient failure (an
+        // evicted Find My cache, a momentary network blip during the pre-flight auth
+        // check) should cost one run, not the scheduler. `beginRun()` already clears
+        // this state at the start of the next run, so a subsequent success recovers
+        // on its own.
         self.lastRunHadFatalError = true
         self.lastErrorMessage = message
+        if let settings, let logger {
+            syncEngine.publishFailureStatusEntity(message: message, settings: settings, logger: logger, app: self)
+        }
     }
 
     private func handleWarnings() {
