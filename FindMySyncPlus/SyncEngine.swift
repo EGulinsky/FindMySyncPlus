@@ -165,12 +165,16 @@ final class SyncEngine {
             return
         }
 
+        // Refresh before preflight: if the FMIP cache files are missing entirely (e.g. evicted
+        // after a reboot or cache cleanup), launching Find My regenerates them. Preflight can
+        // only ever report what's on disk right now — running it first would abort the run
+        // before the one thing that could fix an empty cache ever got a chance to run.
+        let findMyLaunched = await refreshFindMyIfNeeded(kind: kind, settings: settings,
+                                                        logger: logger, dryRun: dryRun)
+
         if hasFMIPSources {
             guard await runPreflight(using: candidates, settings: settings, logger: logger, dryRun: dryRun) else { return }
         }
-
-        let findMyLaunched = await refreshFindMyIfNeeded(kind: kind, settings: settings,
-                                                        logger: logger, dryRun: dryRun)
 
         let io = await readCaches(candidates: candidates, hasFMIPSources: hasFMIPSources,
                                   hasFriendSource: hasFriendSource, settings: settings, logger: logger)
