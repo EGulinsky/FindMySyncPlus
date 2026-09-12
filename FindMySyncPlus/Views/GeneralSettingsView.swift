@@ -85,7 +85,7 @@ struct GeneralSettingsView: View {
                     Text("Startup & Scheduling")
                         .font(.title3).fontWeight(.semibold)
 
-                    InfoTip(message: "Control open at login, start syncing on app launch, and scheduler run frequency.")
+                    InfoTip(message: "Control open at login, start syncing on app launch, scheduler run frequency, and whether a failed or warned run notifies you.")
                     Spacer()
                 }
 
@@ -95,6 +95,7 @@ struct GeneralSettingsView: View {
                 ))
                 SettingsToggleRow(label: "Open Main Window on Startup", isOn: $settings.openMainOnLaunch)
                 SettingsToggleRow(label: "Auto-start Scheduler", isOn: $settings.autoStartSchedulerOnLaunch)
+                SettingsToggleRow(label: "Notify on Sync Errors & Warnings", isOn: $settings.notifyOnSyncIssues)
 
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text("Update Interval ")

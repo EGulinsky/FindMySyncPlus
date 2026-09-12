@@ -370,6 +370,7 @@ private struct InstallCoordinator: View {
                 }
                 // Bind core models and optionally start scheduler on launch
                 app.bind(settings: settings, logger: logger)
+                UserNotifier.shared.requestAuthorizationIfNeeded()
 
                 // Once per launch, not per run: at the default 300 s interval the
                 // scheduler would otherwise repeat this 288 times a day.

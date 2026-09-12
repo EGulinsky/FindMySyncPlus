@@ -174,6 +174,14 @@ final class SettingsStore: ObservableObject {
     @Published var endpointAuthStatus: EndpointAuthStatus = .unverified
     @AppStorage("autoLaunchKillFindMy") var autoLaunchKillFindMy: Bool = true
     @AppStorage("autoStartSchedulerOnLaunch") var autoStartSchedulerOnLaunch: Bool = false
+
+    /// Post a macOS notification when a run ends in a fatal error or a warning.
+    ///
+    /// On by default, unlike most toggles in this file: it changes nothing about
+    /// what gets read, decrypted or published, so there is no downside to surface —
+    /// it only tells someone not currently looking at the app that a background
+    /// sync failed, which is the state a scheduled sync is in almost all the time.
+    @AppStorage("notifyOnSyncIssues") var notifyOnSyncIssues: Bool = true
     @AppStorage("openMainOnLaunch") var openMainOnLaunch: Bool = true
     @AppStorage("findMyWaitSeconds") var findMyWaitSeconds: Double = 10
     @AppStorage("enableDevices") var enableDevices: Bool = true

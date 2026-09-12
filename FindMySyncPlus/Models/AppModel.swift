@@ -531,10 +531,33 @@ final class AppModel: NSObject, ObservableObject {
     func resetAfterRun() {
         self.isPerformingRun = false
         self.currentRunKind = self.isRunning ? .scheduled : .none
+        notifyIfNeeded()
         // Inert unless `demoRenderExport` is set. Renders the screens and quits, so a demo
         // session against a fixture shape is headless end to end.
         if let settings, let logger {
             ViewSnapshotExport.exportIfRequested(app: self, settings: settings, logger: logger)
+        }
+    }
+
+    /// React to how this run ended, exactly once — `resetAfterRun()` runs once per
+    /// `SyncEngine.run()` call via `defer`, while `lastRunHadFatalError` /
+    /// `lastRunHadWarnings` were set (possibly several times, one per `.error()` or
+    /// `.warn()` log line) during the run that just finished. This is the single
+    /// choke point where "how did this run end" is asked once rather than acted on
+    /// per log line — the difference between one MQTT publish and one notification
+    /// per run versus one of each per error line in it.
+    private func notifyIfNeeded() {
+        guard let settings, let logger else { return }
+
+        if lastRunHadFatalError {
+            let message = lastErrorMessage ?? "Unknown error"
+            syncEngine.publishFailureStatusEntity(message: message, settings: settings,
+                                                  logger: logger, app: self)
+            if settings.notifyOnSyncIssues {
+                UserNotifier.shared.notifyError(message)
+            }
+        } else if lastRunHadWarnings, settings.notifyOnSyncIssues {
+            UserNotifier.shared.notifyWarning("Sync completed with warnings — check Status for details.")
         }
     }
 
@@ -548,11 +571,14 @@ final class AppModel: NSObject, ObservableObject {
         // check) should cost one run, not the scheduler. `beginRun()` already clears
         // this state at the start of the next run, so a subsequent success recovers
         // on its own.
+        //
+        // State only, deliberately: a single failed run can log several `.error()`
+        // lines (a missing Devices.data, a missing Items.data, then the pre-flight
+        // summary), and this fires once per line. `resetAfterRun()`'s `notifyIfNeeded()`
+        // is the once-per-run choke point that actually publishes and notifies, using
+        // whichever message this leaves as the final, most-descriptive one.
         self.lastRunHadFatalError = true
         self.lastErrorMessage = message
-        if let settings, let logger {
-            syncEngine.publishFailureStatusEntity(message: message, settings: settings, logger: logger, app: self)
-        }
     }
 
     private func handleWarnings() {
