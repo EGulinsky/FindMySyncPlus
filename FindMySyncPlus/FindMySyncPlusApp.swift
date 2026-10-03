@@ -274,6 +274,7 @@ private struct InstallCoordinator: View {
                 }
                 // Bind core models and optionally start scheduler on launch
                 app.bind(settings: settings, logger: logger)
+                UserNotifier.shared.requestAuthorizationIfNeeded()
                 // The sync run publishes the update entity's versions, so it needs to be
                 // able to ask the checker what the feed said.
                 app.syncEngine.updates = updates

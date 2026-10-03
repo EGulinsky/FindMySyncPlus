@@ -104,4 +104,47 @@ extension SyncEngine {
             },
             prefix: settings.mqttTopicPrefix)
     }
+
+    /// Publish a minimal status entity for a run that never reached its normal completion.
+    /// The counts a full `StatusRun` needs were never computed, so this reports what is
+    /// known (keys, Full Disk Access, whichever cache last wrote) and the error itself.
+    ///
+    /// A failed run no longer stops the scheduler, so without this the status entity would
+    /// keep showing the last successful run's state while runs failed beside it.
+    func publishFailureStatusEntity(message: String,
+                                    settings: SettingsStore,
+                                    logger: LogStore,
+                                    app: AppModel) {
+        guard settings.transportMode == .mqtt else { return }
+
+        let report = SyncStatusReport(
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+                as? String ?? "—",
+            runSeconds: 0,
+            discovered: 0,
+            located: 0,
+            tracked: 0,
+            published: 0,
+            skippedUnchanged: 0,
+            noLocation: 0,
+            unassigned: 0,
+            newUnassigned: UnassignedPartition.newRowsSinceSeen(
+                entries: app.lastLocatedEntries,
+                knownUUIDs: Set(settings.aliases.flatMap { $0.knownUUIDs }),
+                seen: Set(settings.seenUnassigned)),
+            sleptDuringRun: false,
+            findMyLaunched: false,
+            cacheWritten: FMIPCacheFile.newestWrite(among: [.devices, .items, .itemGroups]),
+            keys: SyncStatusReport.keysDescription(fmip: settings.fmipKeyStatus,
+                                                   fmf: settings.fmfKeyStatus,
+                                                   localStorage: settings.localStorageKeyStatus),
+            fullDiskAccess: !logger.needsFullDiskAccess,
+            lastError: message
+        )
+
+        mqtt.publishStatus(report,
+                           lastSuccessfulSync: app.lastSuccessfulSync,
+                           prefix: settings.mqttTopicPrefix,
+                           iso: ISO8601DateFormatter())
+    }
 }

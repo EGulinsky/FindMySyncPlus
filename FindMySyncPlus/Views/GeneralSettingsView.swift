@@ -50,7 +50,7 @@ struct GeneralSettingsView: View {
                      text: "Control the sync schedule, the Find My sources, and the rules for publishing to Home Assistant.")
 
             SettingsGroup(title: "Startup & Scheduling",
-                          tip: "Control open at login, start syncing on app launch, and scheduler run frequency.") {
+                          tip: "Control open at login, start syncing on app launch, scheduler run frequency, and whether a failed or warned run notifies you.") {
                 SettingRow(title: "Open at Login") {
                     AppSwitch(isOn: Binding(
                         get: { loginItemManager.isEnabled },
@@ -61,6 +61,9 @@ struct GeneralSettingsView: View {
                 }
                 SettingRow(title: "Auto-start Scheduler") {
                     AppSwitch(isOn: $settings.autoStartSchedulerOnLaunch)
+                }
+                SettingRow(title: "Notify on Sync Errors & Warnings") {
+                    AppSwitch(isOn: $settings.notifyOnSyncIssues)
                 }
                 SettingRow(title: "Update Interval", qualifier: "minutes") {
                     numberField($intervalMinutes,

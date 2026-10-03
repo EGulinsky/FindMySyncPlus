@@ -531,6 +531,7 @@ final class AppModel: NSObject, ObservableObject {
     func resetAfterRun() {
         self.isPerformingRun = false
         self.currentRunKind = self.isRunning ? .scheduled : .none
+        notifyIfNeeded()
         // Inert unless `demoRenderExport` is set. Renders the screens and quits, so a demo
         // session against a fixture shape is headless end to end.
         if let settings, let logger {
@@ -541,9 +542,40 @@ final class AppModel: NSObject, ObservableObject {
     // MARK: - Error/warning handlers
 
     private func handleFatalError(_ message: String) {
-        stop()
+        // Used to call stop() here: any single `.error()`-level log line, anywhere in
+        // the app, killed the whole scheduler — cancelling the file watcher and
+        // disconnecting MQTT — until the app was relaunched. A transient failure (an
+        // evicted Find My cache, a momentary network blip during the pre-flight auth
+        // check) should cost one run, not the scheduler. `beginRun()` already clears
+        // this state at the start of the next run, so a subsequent success recovers
+        // on its own.
+        //
+        // State only, deliberately: a single failed run can log several `.error()`
+        // lines (a missing Devices.data, a missing Items.data, then the pre-flight
+        // summary), and this fires once per line. `notifyIfNeeded()` is the
+        // once-per-run choke point that publishes and notifies, using whichever
+        // message this leaves as the final, most-descriptive one.
         self.lastRunHadFatalError = true
         self.lastErrorMessage = message
+    }
+
+    /// React to how this run ended, exactly once — `resetAfterRun()` runs once per
+    /// `SyncEngine.run()` call via `defer`, while `lastRunHadFatalError` /
+    /// `lastRunHadWarnings` were set (possibly several times, one per `.error()` or
+    /// `.warn()` log line) during the run that just finished.
+    private func notifyIfNeeded() {
+        guard let settings, let logger else { return }
+
+        if lastRunHadFatalError {
+            let message = lastErrorMessage ?? "Unknown error"
+            syncEngine.publishFailureStatusEntity(message: message, settings: settings,
+                                                  logger: logger, app: self)
+            if settings.notifyOnSyncIssues {
+                UserNotifier.shared.notifyError(message)
+            }
+        } else if lastRunHadWarnings, settings.notifyOnSyncIssues {
+            UserNotifier.shared.notifyWarning("Sync completed with warnings — check Status for details.")
+        }
     }
 
     private func handleWarnings() {
